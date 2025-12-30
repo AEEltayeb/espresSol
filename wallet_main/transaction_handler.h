@@ -4,27 +4,12 @@
 #include "mbedtls/base64.h"
 #include "display_ui.h"
 #include "crypto/ed25519.h"
+#include <memory>
 
-extern WiFiClientSecure tlsClient;
 extern uint8_t ed25519_sk[32];
 extern uint8_t ed25519_pk[32];
 
-inline void sendError(const char* code) {
-  StaticJsonDocument<256> doc;
-  doc["status"] = "error";
-  doc["code"] = code;
-  String out; serializeJson(doc, out); out += "\n";
-  tlsClient.print(out);
-}
-
-inline void sendOkWithSignature(const String& sigHex) {
-  StaticJsonDocument<256> doc;
-  doc["status"] = "ok";
-  doc["signature_hex"] = sigHex;
-  String out; serializeJson(doc, out); out += "\n";
-  tlsClient.print(out);
-}
-
+// Convert bytes to hex string
 inline String bytesToHex(const uint8_t* data, size_t len) {
   const char* hex = "0123456789abcdef";
   String s; s.reserve(len*2);
@@ -32,7 +17,15 @@ inline String bytesToHex(const uint8_t* data, size_t len) {
   return s;
 }
 
-inline bool signAndRespond(const char* msg_b64) {
+// Sign a message and return the signature as hex
+inline String signMessage(const uint8_t* msg, size_t msgLen) {
+  uint8_t sig[64];
+  ed25519_sign(msg, msgLen, ed25519_sk, ed25519_pk, sig);
+  return bytesToHex(sig, 64);
+}
+
+// Sign a base64-encoded message and return signature as hex
+inline String signBase64Message(const char* msg_b64) {
   String b64 = String(msg_b64);
   size_t outLen = 0;
   // First call to get required output length
@@ -41,8 +34,6 @@ inline bool signAndRespond(const char* msg_b64) {
   // Decode the base64 data
   size_t actualLen = 0;
   mbedtls_base64_decode(msg.get(), outLen, &actualLen, (const unsigned char*)b64.c_str(), b64.length());
-  uint8_t sig[64];
-  ed25519_sign(msg.get(), actualLen, ed25519_sk, ed25519_pk, sig);
-  sendOkWithSignature(bytesToHex(sig, 64));
-  return true;
+  return signMessage(msg.get(), actualLen);
 }
+

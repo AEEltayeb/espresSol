@@ -57,9 +57,18 @@ const int BTN_DOWN = 23;   // Red button - decrement/reject
 const int BTN_UP = 19;     // Blue button 1 - increment/scroll
 const int BTN_BACK = 18;   // Blue button 2 - back/cancel
 
+// ===== TLS CONFIGURATION =====
+#define USE_TLS_SERVER 1  // Set to 1 to enable TLS, 0 for plain TCP
+#if USE_TLS_SERVER
+#include "tls_server.h"
+// tlsServer is declared in tls_server.h
+#endif
+
 // ===== GLOBAL OBJECTS =====
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+#if !USE_TLS_SERVER
 WiFiServer wifiServer(SERVER_PORT);
+#endif
 Preferences prefs;
 
 uint8_t ed25519_sk[32];
@@ -92,16 +101,12 @@ int nonce_buffer_idx = 0;
 uint32_t last_msg_time = 0;
 const uint32_t MSG_VALIDITY_WINDOW = 60000;  // 60 seconds
 
+// ===== SESSION TIMEOUT =====
+unsigned long last_activity_time = 0;
+const unsigned long SESSION_TIMEOUT = 300000;  // 5 minutes auto-lock
+
 // ===== UTILITY FUNCTIONS =====
-String bytesToHex(const uint8_t* data, size_t len) {
-  const char* hex = "0123456789abcdef";
-  String s; s.reserve(len*2);
-  for (size_t i=0; i<len; ++i) { 
-    s += hex[(data[i]>>4)&0xF]; 
-    s += hex[data[i]&0xF]; 
-  }
-  return s;
-}
+// bytesToHex is defined in transaction_handler.h
 
 void hexToBytes(const char* hex, uint8_t* out, size_t outLen) {
   for (size_t i = 0; i < outLen; i++) {
@@ -1316,6 +1321,7 @@ void setup() {
       drawCentered("Verifying...", 0);
       if (loadEncryptedKey(prefs, pin_key, ed25519_sk, ed25519_pk)) {
         pin_verified = true;
+        last_activity_time = millis();  // Initialize session timer
         
         // Clear failed attempts on success
         prefs.putInt("pin_fails", 0);
@@ -1428,11 +1434,23 @@ void setup() {
     drawCentered("WiFi Mode", 0);
     delay(500);
     connectWiFi();
+#if USE_TLS_SERVER
+    if (tlsServer.begin(SERVER_PORT)) {
+      Serial.println("[TLS] TLS server started!");
+    } else {
+      Serial.println("[TLS] Failed to start TLS server!");
+    }
+#else
     wifiServer.begin();
+#endif
     Serial.print("[Server] Listening on port "); Serial.println(SERVER_PORT);
     
     String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
+#if USE_TLS_SERVER
+    drawCentered("TLS Ready", -10);
+#else
     drawCentered("WiFi Ready", -10);
+#endif
     drawCentered(ipMsg.c_str(), 10);
   }
 }
@@ -1443,11 +1461,79 @@ void loop() {
   
   // Handle WiFi clients (only if WiFi is connected)
   if (WiFi.status() == WL_CONNECTED) {
+#if USE_TLS_SERVER
+    WiFiClient rawClient = tlsServer.available();
+    if (rawClient) {
+      Serial.println("[TLS] New connection, starting TLS...");
+      drawCentered("TLS Handshake...", 0);
+      
+      TLSClient* tlsClient = new TLSClient();
+      if (tlsClient->begin(&rawClient)) {
+        Serial.println("[TLS] Client connected securely!");
+        drawCentered("TLS Connected!", 0);
+        last_activity_time = millis();  // Reset activity timer
+        
+        // Handle TLS client (simplified protocol)
+        while (tlsClient->connected()) {
+          if (tlsClient->available()) {
+            String line = tlsClient->readStringUntil('\n');
+            line.trim();
+            if (line.length() > 0) {
+              Serial.print("[TLS] Received: "); Serial.println(line);
+              last_activity_time = millis();  // Reset on each message
+              
+              // Process JSON command
+              StaticJsonDocument<1024> doc;
+              if (deserializeJson(doc, line) == DeserializationError::Ok) {
+                // Check replay protection
+                uint32_t nonce = doc["nonce"] | 0;
+                uint32_t timestamp = doc["ts"] | 0;
+                
+                if (!checkReplayProtection(nonce, timestamp)) {
+                  tlsClient->println("{\"ok\":false,\"error\":\"replay_detected\"}");
+                  continue;
+                }
+                
+                const char* cmd = doc["cmd"] | "";
+                if (strcmp(cmd, "PUBKEY") == 0) {
+                  String pubkeyB58 = bytesToBase58(ed25519_pk, 32);
+                  String resp = "{\"ok\":true,\"pubkey\":\"" + pubkeyB58 + "\"}";
+                  tlsClient->println(resp);
+                } else if (strcmp(cmd, "PING") == 0) {
+                  tlsClient->println("{\"ok\":true,\"pong\":true}");
+                }
+              }
+            }
+          }
+          delay(10);
+        }
+        delete tlsClient;
+      } else {
+        Serial.println("[TLS] Handshake failed!");
+        drawCentered("TLS Failed!", 0);
+        delete tlsClient;
+      }
+    }
+#else
     WiFiClient client = wifiServer.available();
     
     if (client) {
       handleClient(client);
+      last_activity_time = millis();  // Reset activity timer
     }
+#endif
+  }
+  
+  // Session timeout - auto-lock after inactivity
+  if (pin_verified && (millis() - last_activity_time > SESSION_TIMEOUT)) {
+    Serial.println("[SEC] Session timeout - locking device");
+    pin_verified = false;
+    memset(ed25519_sk, 0, 32);  // Clear private key from RAM
+    memset(aes_key, 0, 16);     // Clear session key
+    drawCentered("Session Timeout", -10);
+    drawCentered("Device Locked", 10);
+    delay(2000);
+    ESP.restart();  // Restart to require PIN again
   }
   
   delay(10);

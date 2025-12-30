@@ -18,13 +18,26 @@ import base58
 
 # Import local modules
 try:
-    from pc_app.comm_selector import select_comm
+    from pc_app.comm_selector import select_comm, ESP32_HOST, ESP32_PORT
     from pc_app.secure_channel import SecureChannel, SocketTransport, SerialTransport
 except ImportError:
     from comm_selector import select_comm
     from secure_channel import SecureChannel, SocketTransport, SerialTransport
 
-RPC_URL = "https://api.devnet.solana.com"
+# Load config if exists
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+if os.path.exists(CONFIG_PATH):
+    with open(CONFIG_PATH, 'r') as f:
+        config = json.load(f)
+    RPC_URL = config.get("rpc_url", "https://api.devnet.solana.com")
+    # Update comm_selector with config values
+    import comm_selector
+    comm_selector.ESP32_HOST = config.get("esp32_ip", "192.168.1.100")
+    comm_selector.ESP32_PORT = config.get("port", 8443)
+    comm_selector.USE_TLS = config.get("use_tls", False)
+else:
+    RPC_URL = "https://api.devnet.solana.com"
+
 DEFAULT_LAMPORTS = 100_000_000
 
 

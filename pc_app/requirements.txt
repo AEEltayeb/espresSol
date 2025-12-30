@@ -1,4 +1,13 @@
-solana==0.30.2
-solders==0.18.1
-base58
-httpx
+# DIY Hardware Wallet - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+pyserial>=3.5
+solana>=0.30.0
+solders>=0.18.0
+base58>=2.1.0
+pycryptodome>=3.19.0
+cryptography>=41.0.0
+
+# Optional - for development
+colorama>=0.4.6
