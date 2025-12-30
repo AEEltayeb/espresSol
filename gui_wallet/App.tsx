@@ -303,6 +303,12 @@ function HomeTab({ setMessage }: { setMessage: (m: string) => void }) {
       contentContainerStyle={styles.scrollContent}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={COLORS.primary} />}
     >
+      {/* Header */}
+      <View style={styles.pageHeader}>
+        <EspressoLogo size={32} />
+        <Text style={styles.pageTitle}>Home</Text>
+      </View>
+
       {/* Balance Card */}
       <View style={styles.balanceCard}>
         <Text style={styles.balanceLabel}>Total Balance</Text>
@@ -374,6 +380,12 @@ function AnalyticsTab() {
 
   return (
     <ScrollView style={styles.tabContent} contentContainerStyle={styles.scrollContent}>
+      {/* Header */}
+      <View style={styles.pageHeader}>
+        <ChartIcon active={true} />
+        <Text style={styles.pageTitle}>Analytics</Text>
+      </View>
+
       <View style={styles.statsGrid}>
         <View style={styles.statCard}>
           <Text style={styles.statValue}>{solBalance.toFixed(4)}</Text>
@@ -420,6 +432,12 @@ function ProfileTab({ setMessage }: { setMessage: (m: string) => void }) {
 
   return (
     <ScrollView style={styles.tabContent} contentContainerStyle={styles.scrollContent}>
+      {/* Header */}
+      <View style={styles.pageHeader}>
+        <UserIcon active={true} />
+        <Text style={styles.pageTitle}>Profile</Text>
+      </View>
+
       <View style={styles.profileHeader}>
         <EspressoLogo size={56} />
         <Text style={styles.profileName}>espresSol</Text>
@@ -464,9 +482,10 @@ function DashboardScreen() {
   return (
     <View style={styles.container}>
       {message !== '' && (
-        <View style={styles.messageBanner}>
+        <TouchableOpacity style={styles.messageBanner} onPress={() => setMessage('')} activeOpacity={0.8}>
           <Text style={styles.messageText}>{message}</Text>
-        </View>
+          <Text style={styles.dismissHint}>Tap to dismiss</Text>
+        </TouchableOpacity>
       )}
 
       {activeTab === 'home' && <HomeTab setMessage={setMessage} />}
@@ -510,6 +529,10 @@ const styles = StyleSheet.create({
   tabContent: { flex: 1 },
   scrollContent: { padding: 20, paddingTop: 60, paddingBottom: 120 },
 
+  // Page Header
+  pageHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 24 },
+  pageTitle: { fontSize: 28, fontWeight: '700', color: COLORS.text, marginLeft: 12 },
+
   // Connect
   connectCard: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 24, paddingTop: 80 },
   title: { fontSize: 32, fontWeight: '700', color: COLORS.text, marginTop: 16 },
@@ -534,6 +557,7 @@ const styles = StyleSheet.create({
   // Message
   messageBanner: { backgroundColor: COLORS.glass, padding: 14, marginHorizontal: 20, marginTop: 50, borderRadius: 16, borderWidth: 1, borderColor: COLORS.border },
   messageText: { color: COLORS.text, textAlign: 'center', fontSize: 14 },
+  dismissHint: { color: COLORS.textMuted, textAlign: 'center', fontSize: 10, marginTop: 4 },
 
   // Balance
   balanceCard: { backgroundColor: COLORS.card, borderRadius: 24, padding: 28, marginBottom: 16, borderWidth: 1, borderColor: COLORS.border },
