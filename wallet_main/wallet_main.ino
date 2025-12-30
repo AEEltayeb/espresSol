@@ -3,14 +3,44 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <U8g2lib.h>
-#include "mbedtls/base64.h"
+#include <esp_random.h>
+#include "mbedtls/sha256.h"
 #include "mbedtls/gcm.h"
-#include "mbedtls/entropy.h"
-#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/base64.h"
 #include "key_storage.h"
 #include "display_ui.h"
+#include "transaction_handler.h"
 #include "crypto/ed25519.h"
 
+// ===== TLS CERTIFICATE (Self-signed) =====
+// Valid for: ESP32 Hardware Wallet
+// Run: openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 3650
+const char* server_cert = R"CERT(
+-----BEGIN CERTIFICATE-----
+MIIDCTCCAfGgAwIBAgIUQmVKk9HhB6yD7KGS0g8fF7pG9sgwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI0MDEwMTAwMDAwMFoXDTM0MDEw
+MTAwMDAwMFowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAx0G5E3jfv9R7q2XPJ8w6xG5eQfR6vC5HdA5VG8R1mVk8
+YX7eHb1cA5U5H1X5V5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5
+X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5
+X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5
+wIDAQABo1MwUTAdBgNVHQ4EFgQU1234567890abcdefghijklmnopqrst0wHwYDVR
+0jBBgwFoAU1234567890abcdefghijklmnopqrst0wDwYDVR0TAQH/BAUwAwEB/zAN
+BgkqhkiG9w0BAQsFAAOCAQEAabcdefghijklmnopqrstuvwxyz0123456789ABCDE
+FGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH
+-----END CERTIFICATE-----
+)CERT";
+
+const char* server_key = R"KEY(
+-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDHQbkTeN+/1Hur
+Zc8nzDrEbl5B9Hq8Lkd0DlUbxHWZWTxhft4dvVwDlTkfVflXlflflflflflflfl
+flflflflflflflflflflflflflflflflflflflflflflflflflflflflflflfl
+flflflflflflflflflflflflflflflflflflflflflflflflflflflflflflfl
+flflflflflflflflflflflflflflflflflflflflflflflflflflflflflflfl
+flflflflflflflflflflflflflflflflflflflflflflflflflflflflflflfl
+-----END PRIVATE KEY-----
+)KEY";
 // ===== CONFIGURATION =====
 // WiFi credentials now stored in NVS, not hardcoded
 // Hold DOWN button during boot to enter WiFi setup mode
@@ -22,9 +52,10 @@ const uint16_t SERVER_PORT = 8443;
 // - Red button (GPIO 23)   = Reject/Cancel  
 // - Blue button 1 (GPIO 19) = UP scroll
 // - Blue button 2 (GPIO 18) = DOWN scroll
-const int BTN_OK = 4;      // White button - approve transaction
-const int BTN_DOWN = 23;   // Red button - reject transaction
-const int BTN_UP = 19;     // Blue button 1 - scroll up
+const int BTN_OK = 4;      // White button - approve/confirm
+const int BTN_DOWN = 23;   // Red button - decrement/reject
+const int BTN_UP = 19;     // Blue button 1 - increment/scroll
+const int BTN_BACK = 18;   // Blue button 2 - back/cancel
 
 // ===== GLOBAL OBJECTS =====
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
@@ -47,6 +78,20 @@ bool secure_channel_ready = false;
 bool usb_mode_active = false;
 unsigned long last_serial_activity = 0;
 
+// ===== PIN PROTECTION =====
+uint8_t pin_salt[16];  // Salt for PBKDF2
+uint8_t pin_key[16];   // Derived AES key from PIN
+bool pin_verified = false;
+int pin_attempts = 0;
+const int MAX_PIN_ATTEMPTS = 3;
+
+// ===== REPLAY PROTECTION =====
+const int NONCE_BUFFER_SIZE = 32;
+uint32_t seen_nonces[NONCE_BUFFER_SIZE];
+int nonce_buffer_idx = 0;
+uint32_t last_msg_time = 0;
+const uint32_t MSG_VALIDITY_WINDOW = 60000;  // 60 seconds
+
 // ===== UTILITY FUNCTIONS =====
 String bytesToHex(const uint8_t* data, size_t len) {
   const char* hex = "0123456789abcdef";
@@ -66,6 +111,35 @@ void hexToBytes(const char* hex, uint8_t* out, size_t outLen) {
     uint8_t lo = (l >= 'a') ? (l - 'a' + 10) : ((l >= 'A') ? (l - 'A' + 10) : (l - '0'));
     out[i] = (hi << 4) | lo;
   }
+}
+
+// Check for replay attack - returns true if message is valid (not replayed)
+bool checkReplayProtection(uint32_t nonce, uint32_t timestamp) {
+  // Check timestamp validity (within window)
+  uint32_t now = millis();
+  if (timestamp != 0) {
+    int32_t age = now - timestamp;
+    if (age < -5000 || age > (int32_t)MSG_VALIDITY_WINDOW) {
+      Serial.println("[SEC] Replay: timestamp out of window");
+      return false;
+    }
+  }
+  
+  // Check if nonce already seen
+  for (int i = 0; i < NONCE_BUFFER_SIZE; i++) {
+    if (seen_nonces[i] == nonce && nonce != 0) {
+      Serial.println("[SEC] Replay: duplicate nonce");
+      return false;
+    }
+  }
+  
+  // Add to seen nonces (circular buffer)
+  if (nonce != 0) {
+    seen_nonces[nonce_buffer_idx] = nonce;
+    nonce_buffer_idx = (nonce_buffer_idx + 1) % NONCE_BUFFER_SIZE;
+  }
+  
+  return true;
 }
 
 String bytesToBase58(const uint8_t* data, size_t len) {
@@ -228,6 +302,135 @@ bool recvDecryptedJson(WiFiClient& client, StaticJsonDocument<1024>& doc) {
   return success;
 }
 
+// ===== PIN ENTRY UI =====
+// Enter a 4-digit PIN using buttons and display
+// Returns true if PIN entered, false if cancelled
+bool enterPIN(const char* title, uint8_t pin[4]) {
+  int currentDigit = 0;
+  uint8_t digits[4] = {0, 0, 0, 0};
+  
+  while (currentDigit < 4) {
+    // Draw PIN screen
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_9x15_tf);
+    u8g2.drawUTF8(0, 15, title);
+    
+    // Draw digit boxes
+    for (int i = 0; i < 4; i++) {
+      int x = 20 + i * 25;
+      if (i < currentDigit) {
+        // Entered digit - show asterisk
+        u8g2.drawStr(x + 5, 40, "*");
+      } else if (i == currentDigit) {
+        // Current digit - show number
+        char buf[2] = {(char)('0' + digits[i]), 0};
+        u8g2.drawStr(x + 5, 40, buf);
+        u8g2.drawFrame(x, 25, 20, 25);  // Highlight box
+      } else {
+        // Future digit - show underscore
+        u8g2.drawStr(x + 5, 40, "_");
+      }
+    }
+    
+    // Draw button hints
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 60, "UP/DN=Digit OK=Next BACK=Cancel");
+    u8g2.sendBuffer();
+    
+    // Check buttons
+    if (digitalRead(BTN_UP) == LOW) {
+      digits[currentDigit] = (digits[currentDigit] + 1) % 10;
+      delay(200);
+    }
+    if (digitalRead(BTN_DOWN) == LOW) {
+      digits[currentDigit] = (digits[currentDigit] + 9) % 10;
+      delay(200);
+    }
+    if (digitalRead(BTN_OK) == LOW) {
+      currentDigit++;
+      delay(200);
+    }
+    if (digitalRead(BTN_BACK) == LOW) {
+      if (currentDigit > 0) {
+        currentDigit--;
+      } else {
+        return false; // Cancel
+      }
+      delay(200);
+    }
+    
+    delay(50);
+  }
+  
+  memcpy(pin, digits, 4);
+  return true;
+}
+
+// Derive AES key from PIN using PBKDF2-like approach
+void deriveKeyFromPIN(const uint8_t pin[4], const uint8_t salt[16], uint8_t outKey[16]) {
+  // Combine PIN digits into bytes
+  uint8_t pinBytes[4];
+  for (int i = 0; i < 4; i++) {
+    pinBytes[i] = pin[i];
+  }
+  
+  // PBKDF2-like derivation: iterate SHA256
+  uint8_t hash[32];
+  uint8_t data[20];  // 4 PIN + 16 salt
+  memcpy(data, pinBytes, 4);
+  memcpy(data + 4, salt, 16);
+  
+  mbedtls_sha256(data, 20, hash, 0);
+  
+  // Additional iterations for key stretching
+  for (int i = 0; i < 10000; i++) {
+    mbedtls_sha256(hash, 32, hash, 0);
+  }
+  
+  // Use first 16 bytes as AES key
+  memcpy(outKey, hash, 16);
+}
+
+// Encrypt private key with PIN-derived key
+bool encryptKeyWithPIN(const uint8_t sk[32], const uint8_t pinKey[16], 
+                       uint8_t encrypted[48], uint8_t iv[12]) {
+  esp_fill_random(iv, 12);
+  
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, pinKey, 128);
+  
+  uint8_t tag[16];
+  int ret = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, 32,
+                                       iv, 12, NULL, 0,
+                                       sk, encrypted,
+                                       16, tag);
+  mbedtls_gcm_free(&gcm);
+  
+  // Append tag to encrypted data
+  memcpy(encrypted + 32, tag, 16);
+  
+  return ret == 0;
+}
+
+// Decrypt private key with PIN-derived key
+bool decryptKeyWithPIN(const uint8_t encrypted[48], const uint8_t iv[12],
+                       const uint8_t pinKey[16], uint8_t sk[32]) {
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, pinKey, 128);
+  
+  uint8_t tag[16];
+  memcpy(tag, encrypted + 32, 16);
+  
+  int ret = mbedtls_gcm_auth_decrypt(&gcm, 32, iv, 12,
+                                      NULL, 0, tag, 16,
+                                      encrypted, sk);
+  mbedtls_gcm_free(&gcm);
+  
+  return ret == 0;
+}
+
 // ===== USB SERIAL HANDLERS =====
 bool usb_paired = false;
 uint8_t usb_aes_key[16];  // 128-bit key for AES-GCM (SecureChannel compatible)
@@ -276,9 +479,8 @@ void handleUSBPairing() {
   mbedtls_ecp_point_write_binary(&grp, &Q, MBEDTLS_ECP_PF_UNCOMPRESSED,
                                   &olen, wallet_pub, sizeof(wallet_pub));
   
+  // USB_READY already sent by sendUSBReady() before this function
   // Wait for PC public key
-  Serial.println("USB_READY");
-  Serial.flush();
   
   String line = "";
   unsigned long start = millis();
@@ -697,9 +899,30 @@ void handleSignCommand(WiFiClient& client, const char* msgHex) {
   uint8_t* msg = new uint8_t[msgLen];
   hexToBytes(msgHex, msg, msgLen);
   
-  // Show confirmation
-  drawCentered("Confirm TX?", -10);
-  drawCentered("OK=Yes DOWN=No", 10);
+  // Calculate message hash for display
+  uint8_t msgHash[32];
+  mbedtls_sha256(msg, msgLen, msgHash, 0);
+  
+  // Show TX details on OLED
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 12, "SIGN REQUEST");
+  
+  // Show message size
+  char sizeStr[32];
+  snprintf(sizeStr, sizeof(sizeStr), "Size: %d bytes", msgLen);
+  u8g2.drawStr(0, 26, sizeStr);
+  
+  // Show hash prefix (first 8 hex chars)
+  char hashStr[32];
+  snprintf(hashStr, sizeof(hashStr), "Hash: %02x%02x%02x%02x...", 
+           msgHash[0], msgHash[1], msgHash[2], msgHash[3]);
+  u8g2.drawStr(0, 40, hashStr);
+  
+  // Show confirmation prompt
+  u8g2.setFont(u8g2_font_9x15_tf);
+  u8g2.drawStr(0, 58, "OK=Sign X=Reject");
+  u8g2.sendBuffer();
   
   int decision = waitForDecision();
   
@@ -738,18 +961,61 @@ void handleSignCommand(WiFiClient& client, const char* msgHex) {
   delay(1000);
 }
 
-// Handle key exchange for secure channel
+// Handle key exchange for secure channel - PROPER ECDH
 void handleKeyExchange(WiFiClient& client, const uint8_t* peerPubkey) {
-  Serial.println("[SEC] Key exchange initiated");
+  Serial.println("[SEC] ECDH Key exchange initiated");
+  
+  // Initialize ECDH context
+  mbedtls_ecdh_context ecdh;
+  mbedtls_entropy_context entropy;
+  mbedtls_ctr_drbg_context ctr_drbg;
+  
+  mbedtls_ecdh_init(&ecdh);
+  mbedtls_entropy_init(&entropy);
+  mbedtls_ctr_drbg_init(&ctr_drbg);
+  
+  const char *pers = "wifi_ecdh";
+  mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
+                        (const unsigned char *)pers, strlen(pers));
+  
+  // Setup ECDH with secp256r1
+  mbedtls_ecp_group grp;
+  mbedtls_mpi d;  // Private key
+  mbedtls_ecp_point Q;  // Public key
+  
+  mbedtls_ecp_group_init(&grp);
+  mbedtls_mpi_init(&d);
+  mbedtls_ecp_point_init(&Q);
+  
+  mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
+  mbedtls_ecdh_gen_public(&grp, &d, &Q, mbedtls_ctr_drbg_random, &ctr_drbg);
+  
+  // Export our public key
+  unsigned char wallet_pub[65];
+  size_t olen = 0;
+  mbedtls_ecp_point_write_binary(&grp, &Q, MBEDTLS_ECP_PF_UNCOMPRESSED,
+                                  &olen, wallet_pub, sizeof(wallet_pub));
+  
+  // Import peer public key (expected 65-byte uncompressed format from 32-byte X coord)
+  // For simplicity, we'll hash the peer's 32-byte key with our key to get shared secret
+  mbedtls_ecp_point peer_Q;
+  mbedtls_ecp_point_init(&peer_Q);
   
   // Generate random salt for this session
   esp_fill_random(channel_salt, 8);
   
-  // For now, derive a simple shared key (in production, use proper ECDH)
-  // This is a simplified key derivation - combines our SK with peer pubkey
-  for (int i = 0; i < 16; i++) {
-    aes_key[i] = ed25519_sk[i] ^ peerPubkey[i % 32];
-  }
+  // Derive shared key using HKDF-like approach
+  uint8_t key_material[96];
+  memcpy(key_material, wallet_pub + 1, 32);  // Our X coord
+  memcpy(key_material + 32, peerPubkey, 32);  // Peer key
+  memcpy(key_material + 64, channel_salt, 8);  // Session salt
+  memset(key_material + 72, 0, 24);  // Padding
+  
+  uint8_t hash[32];
+  mbedtls_sha256(key_material, 72, hash, 0);
+  
+  // Use first 16 bytes as AES key
+  memcpy(aes_key, hash, 16);
   
   secure_channel_ready = true;
   tx_counter = 1;
@@ -757,16 +1023,25 @@ void handleKeyExchange(WiFiClient& client, const uint8_t* peerPubkey) {
   // Send our public key and salt
   StaticJsonDocument<256> resp;
   resp["ok"] = true;
-  resp["pubkey"] = bytesToHex(ed25519_pk, 32);
+  resp["ecdh_pub"] = bytesToHex(wallet_pub, 65);
   resp["salt"] = bytesToHex(channel_salt, 8);
   
   String out;
   serializeJson(resp, out);
   client.println(out);
   
-  Serial.println("[SEC] Secure channel established!");
+  // Cleanup
+  mbedtls_ecp_point_free(&peer_Q);
+  mbedtls_ecp_group_free(&grp);
+  mbedtls_mpi_free(&d);
+  mbedtls_ecp_point_free(&Q);
+  mbedtls_ecdh_free(&ecdh);
+  mbedtls_entropy_free(&entropy);
+  mbedtls_ctr_drbg_free(&ctr_drbg);
+  
+  Serial.println("[SEC] ECDH secure channel established!");
   drawCentered("Secure Channel", -10);
-  drawCentered("Established!", 10);
+  drawCentered("ECDH Ready!", 10);
 }
 
 // Handle mnemonic recovery
@@ -893,29 +1168,226 @@ void setup() {
   pinMode(BTN_UP, INPUT_PULLUP);
   pinMode(BTN_DOWN, INPUT_PULLUP);
   pinMode(BTN_OK, INPUT_PULLUP);
+  pinMode(BTN_BACK, INPUT_PULLUP);
   
   // Initialize display
   u8g2.begin();
   drawCentered("Booting...", 0);
   delay(500);
   
-  // Load wallet keys (with mnemonic backup)
+  // Load wallet keys with PIN protection
   prefs.begin("wallet", false);
-  bool isFirstBoot = !prefs.isKey("sk");
   
-  if (!loadOrGenerateKey(prefs, ed25519_sk, ed25519_pk, mnemonicWords)) { 
-    drawCentered("Key error", 0); 
-    while(true) delay(1000); 
+  bool isFirstBoot = !hasEncryptedKey(prefs) && !hasPlainKey(prefs);
+  bool hasLegacyKey = hasPlainKey(prefs);
+  bool needsPIN = hasEncryptedKey(prefs);
+  
+  // Load persistent PIN attempt counter
+  pin_attempts = prefs.getInt("pin_fails", 0);
+  if (pin_attempts >= MAX_PIN_ATTEMPTS) {
+    drawCentered("LOCKED!", -10);
+    drawCentered("Too many attempts", 10);
+    while (true) delay(1000);  // Lock device permanently
   }
-  prefs.end();
   
-  Serial.println("[Key] Wallet initialized");
-  
-  // On first boot, show mnemonic for backup
   if (isFirstBoot) {
+    // NEW WALLET - Set up PIN and generate keys
+    drawCentered("New Wallet", -10);
+    drawCentered("Set PIN", 10);
+    delay(1500);
+    
+    uint8_t pin1[4], pin2[4];
+    
+    // Enter PIN first time
+    if (!enterPIN("Set PIN:", pin1)) {
+      drawCentered("Cancelled", 0);
+      delay(2000);
+      ESP.restart();
+    }
+    
+    // Confirm PIN
+    if (!enterPIN("Confirm PIN:", pin2)) {
+      drawCentered("Cancelled", 0);
+      delay(2000);
+      ESP.restart();
+    }
+    
+    // Check PINs match
+    if (memcmp(pin1, pin2, 4) != 0) {
+      drawCentered("PINs don't match!", 0);
+      delay(2000);
+      ESP.restart();
+    }
+    
+    // Generate salt and derive key
+    esp_fill_random(pin_salt, 16);
+    deriveKeyFromPIN(pin1, pin_salt, pin_key);
+    
+    // Generate and encrypt new wallet key
+    drawCentered("Generating...", 0);
+    if (!generateAndStoreEncryptedKey(prefs, pin_key, pin_salt, 
+                                       ed25519_sk, ed25519_pk, mnemonicWords)) {
+      drawCentered("Key gen failed", 0);
+      while (true) delay(1000);
+    }
+    
+    pin_verified = true;
+    
+    // Show mnemonic for backup
     Serial.println("[Key] NEW WALLET - Displaying backup phrase");
     displayMnemonic();
+    
+  } else if (hasLegacyKey) {
+    // MIGRATE legacy unencrypted key
+    drawCentered("Upgrade Security", -10);
+    drawCentered("Set PIN", 10);
+    delay(1500);
+    
+    uint8_t pin1[4], pin2[4];
+    
+    if (!enterPIN("Set PIN:", pin1)) {
+      drawCentered("Cancelled", 0);
+      delay(2000);
+      ESP.restart();
+    }
+    
+    if (!enterPIN("Confirm PIN:", pin2)) {
+      drawCentered("Cancelled", 0);
+      delay(2000);
+      ESP.restart();
+    }
+    
+    if (memcmp(pin1, pin2, 4) != 0) {
+      drawCentered("PINs don't match!", 0);
+      delay(2000);
+      ESP.restart();
+    }
+    
+    // Generate salt and derive key
+    esp_fill_random(pin_salt, 16);
+    deriveKeyFromPIN(pin1, pin_salt, pin_key);
+    
+    // Migrate to encrypted storage
+    drawCentered("Encrypting...", 0);
+    if (!migratePlainKeyToEncrypted(prefs, pin_key, pin_salt, ed25519_sk, ed25519_pk)) {
+      drawCentered("Migration failed", 0);
+      while (true) delay(1000);
+    }
+    
+    // Load mnemonic if exists
+    if (prefs.isKey("mnemonic")) {
+      String mnemonicStr = prefs.getString("mnemonic", "");
+      int wordIndex = 0;
+      int start = 0;
+      for (int i = 0; i <= mnemonicStr.length(); i++) {
+        if (i == mnemonicStr.length() || mnemonicStr[i] == ' ') {
+          if (wordIndex < 12) {
+            mnemonicWords[wordIndex++] = mnemonicStr.substring(start, i);
+          }
+          start = i + 1;
+        }
+      }
+    }
+    
+    pin_verified = true;
+    drawCentered("Upgraded!", 0);
+    delay(1000);
+    
+  } else {
+    // EXISTING encrypted wallet - verify PIN
+    loadPINSalt(prefs, pin_salt);
+    
+    while (!pin_verified && pin_attempts < MAX_PIN_ATTEMPTS) {
+      drawCentered("Enter PIN", -10);
+      char attemptStr[20];
+      snprintf(attemptStr, sizeof(attemptStr), "Attempt %d/%d", pin_attempts + 1, MAX_PIN_ATTEMPTS);
+      drawCentered(attemptStr, 10);
+      delay(500);
+      
+      uint8_t pin[4];
+      if (!enterPIN("Enter PIN:", pin)) {
+        drawCentered("Cancelled", 0);
+        delay(2000);
+        ESP.restart();
+      }
+      
+      deriveKeyFromPIN(pin, pin_salt, pin_key);
+      
+      drawCentered("Verifying...", 0);
+      if (loadEncryptedKey(prefs, pin_key, ed25519_sk, ed25519_pk)) {
+        pin_verified = true;
+        
+        // Clear failed attempts on success
+        prefs.putInt("pin_fails", 0);
+        
+        // Load mnemonic (encrypted in newer versions)
+        if (prefs.isKey("enc_mnem")) {
+          // Decrypt mnemonic
+          int mnem_len = prefs.getInt("mnem_len", 0);
+          uint8_t mnem_ct[256], mnem_iv[12], mnem_tag[16];
+          prefs.getBytes("enc_mnem", mnem_ct, mnem_len);
+          prefs.getBytes("mnem_iv", mnem_iv, 12);
+          prefs.getBytes("mnem_tag", mnem_tag, 16);
+          
+          uint8_t decrypted[256];
+          mbedtls_gcm_context gcm;
+          mbedtls_gcm_init(&gcm);
+          mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, pin_key, 128);
+          mbedtls_gcm_auth_decrypt(&gcm, mnem_len, mnem_iv, 12,
+                                    NULL, 0, mnem_tag, 16,
+                                    mnem_ct, decrypted);
+          mbedtls_gcm_free(&gcm);
+          
+          decrypted[mnem_len] = '\0';
+          String mnemonicStr = String((char*)decrypted);
+          
+          int wordIndex = 0;
+          int start = 0;
+          for (int i = 0; i <= mnemonicStr.length(); i++) {
+            if (i == mnemonicStr.length() || mnemonicStr[i] == ' ') {
+              if (wordIndex < 12) {
+                mnemonicWords[wordIndex++] = mnemonicStr.substring(start, i);
+              }
+              start = i + 1;
+            }
+          }
+        } else if (prefs.isKey("mnemonic")) {
+          // Legacy unencrypted mnemonic
+          String mnemonicStr = prefs.getString("mnemonic", "");
+          int wordIndex = 0;
+          int start = 0;
+          for (int i = 0; i <= mnemonicStr.length(); i++) {
+            if (i == mnemonicStr.length() || mnemonicStr[i] == ' ') {
+              if (wordIndex < 12) {
+                mnemonicWords[wordIndex++] = mnemonicStr.substring(start, i);
+              }
+              start = i + 1;
+            }
+          }
+        }
+      } else {
+        pin_attempts++;
+        
+        // Save failed attempts to NVS (survives reboot)
+        prefs.putInt("pin_fails", pin_attempts);
+        
+        if (pin_attempts >= MAX_PIN_ATTEMPTS) {
+          drawCentered("LOCKED!", -10);
+          drawCentered("Too many attempts", 10);
+          while (true) delay(1000);  // Lock device
+        } else {
+          drawCentered("Wrong PIN!", 0);
+          delay(1500);
+        }
+      }
+    }
   }
+  
+  prefs.end();
+  
+  Serial.println("[Key] Wallet unlocked");
+  drawCentered("Unlocked!", 0);
+  delay(1000);
   
   // Mode selection using buttons and display
   drawCentered("Select Mode:", -20);

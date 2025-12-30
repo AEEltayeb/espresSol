@@ -3,22 +3,165 @@
 #include <Arduino.h>
 #include "crypto/ed25519.h"
 #include "crypto/mnemonic.h"
+#include "mbedtls/sha256.h"
+#include "mbedtls/gcm.h"
 
-// Load key from storage or generate new one with mnemonic backup
+// Check if wallet has encrypted keys stored
+inline bool hasEncryptedKey(Preferences& prefs) {
+  return prefs.isKey("enc_sk") && prefs.isKey("sk_iv") && prefs.isKey("pin_salt");
+}
+
+// Check if wallet has plain (legacy) key stored
+inline bool hasPlainKey(Preferences& prefs) {
+  return prefs.isKey("sk") && !prefs.isKey("enc_sk");
+}
+
+// Load encrypted key and decrypt with PIN
+inline bool loadEncryptedKey(Preferences& prefs, const uint8_t pinKey[16], 
+                             uint8_t sk[32], uint8_t pk[32]) {
+  uint8_t encrypted[48];
+  uint8_t iv[12];
+  
+  if (prefs.getBytes("enc_sk", encrypted, 48) != 48) return false;
+  if (prefs.getBytes("sk_iv", iv, 12) != 12) return false;
+  
+  // Decrypt with AES-GCM
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, pinKey, 128);
+  
+  uint8_t tag[16];
+  memcpy(tag, encrypted + 32, 16);
+  
+  int ret = mbedtls_gcm_auth_decrypt(&gcm, 32, iv, 12,
+                                      NULL, 0, tag, 16,
+                                      encrypted, sk);
+  mbedtls_gcm_free(&gcm);
+  
+  if (ret != 0) return false;  // Wrong PIN
+  
+  // Derive public key
+  ed25519_publickey(sk, pk);
+  return true;
+}
+
+// Generate new key, encrypt with PIN, and store
+inline bool generateAndStoreEncryptedKey(Preferences& prefs, const uint8_t pinKey[16],
+                                          const uint8_t salt[16],
+                                          uint8_t sk[32], uint8_t pk[32], 
+                                          String mnemonic[12]) {
+  // Generate entropy and mnemonic
+  uint8_t entropy[12];
+  esp_fill_random(entropy, 12);
+  generateMnemonic(entropy, mnemonic);
+  entropyToKey(entropy, sk);
+  ed25519_publickey(sk, pk);
+  
+  // Encrypt private key
+  uint8_t encrypted[48];
+  uint8_t iv[12];
+  esp_fill_random(iv, 12);
+  
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, pinKey, 128);
+  
+  uint8_t tag[16];
+  int ret = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, 32,
+                                       iv, 12, NULL, 0, sk, encrypted, 16, tag);
+  mbedtls_gcm_free(&gcm);
+  
+  if (ret != 0) return false;
+  
+  memcpy(encrypted + 32, tag, 16);
+  
+  // Store encrypted key, IV, and salt
+  prefs.putBytes("enc_sk", encrypted, 48);
+  prefs.putBytes("sk_iv", iv, 12);
+  prefs.putBytes("pin_salt", salt, 16);
+  
+  // Encrypt and store mnemonic
+  String mnemonicStr = "";
+  for (int i = 0; i < 12; i++) {
+    if (i > 0) mnemonicStr += " ";
+    mnemonicStr += mnemonic[i];
+  }
+  
+  // Encrypt mnemonic with same key
+  uint8_t mnem_iv[12];
+  esp_fill_random(mnem_iv, 12);
+  
+  uint8_t mnem_ct[256];
+  uint8_t mnem_tag[16];
+  
+  mbedtls_gcm_context gcm2;
+  mbedtls_gcm_init(&gcm2);
+  mbedtls_gcm_setkey(&gcm2, MBEDTLS_CIPHER_ID_AES, pinKey, 128);
+  mbedtls_gcm_crypt_and_tag(&gcm2, MBEDTLS_GCM_ENCRYPT, mnemonicStr.length(),
+                             mnem_iv, 12, NULL, 0,
+                             (const uint8_t*)mnemonicStr.c_str(), mnem_ct,
+                             16, mnem_tag);
+  mbedtls_gcm_free(&gcm2);
+  
+  prefs.putBytes("enc_mnem", mnem_ct, mnemonicStr.length());
+  prefs.putBytes("mnem_iv", mnem_iv, 12);
+  prefs.putBytes("mnem_tag", mnem_tag, 16);
+  prefs.putInt("mnem_len", mnemonicStr.length());
+  
+  return true;
+}
+
+// Migrate legacy plain key to encrypted storage
+inline bool migratePlainKeyToEncrypted(Preferences& prefs, const uint8_t pinKey[16],
+                                        const uint8_t salt[16],
+                                        uint8_t sk[32], uint8_t pk[32]) {
+  // Load existing plain key
+  if (prefs.getBytes("sk", sk, 32) != 32) return false;
+  ed25519_publickey(sk, pk);
+  
+  // Encrypt it
+  uint8_t encrypted[48];
+  uint8_t iv[12];
+  esp_fill_random(iv, 12);
+  
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, pinKey, 128);
+  
+  uint8_t tag[16];
+  int ret = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, 32,
+                                       iv, 12, NULL, 0, sk, encrypted, 16, tag);
+  mbedtls_gcm_free(&gcm);
+  
+  if (ret != 0) return false;
+  
+  memcpy(encrypted + 32, tag, 16);
+  
+  // Store encrypted version
+  prefs.putBytes("enc_sk", encrypted, 48);
+  prefs.putBytes("sk_iv", iv, 12);
+  prefs.putBytes("pin_salt", salt, 16);
+  
+  // Remove plain key
+  prefs.remove("sk");
+  
+  return true;
+}
+
+// Load PIN salt
+inline bool loadPINSalt(Preferences& prefs, uint8_t salt[16]) {
+  return prefs.getBytes("pin_salt", salt, 16) == 16;
+}
+
+// Legacy function for backward compatibility
 inline bool loadOrGenerateKey(Preferences& prefs, uint8_t sk[32], uint8_t pk[32], String mnemonic[12]) {
-  // Check if key already exists
+  // This is now a stub - PIN-based loading is handled in setup()
   if (prefs.isKey("sk")) {
     size_t n = prefs.getBytes("sk", sk, 32);
     if (n != 32) return false;
     ed25519_publickey(sk, pk);
     
-    // Try to load existing mnemonic
-    // FORCE REGENERATION: Delete old mnemonic format (remove this after one boot)
-    if (prefs.isKey("mnemonic")) {
-      prefs.remove("mnemonic");
-      Serial.println("[Key] Deleted old mnemonic - will regenerate");
-    }
-    
+    // Load mnemonic if exists
     if (prefs.isKey("mnemonic")) {
       String mnemonicStr = prefs.getString("mnemonic", "");
       int wordIndex = 0;
@@ -31,77 +174,40 @@ inline bool loadOrGenerateKey(Preferences& prefs, uint8_t sk[32], uint8_t pk[32]
           start = i + 1;
         }
       }
-    } else {
-      // BACKWARD COMPATIBILITY: Generate mnemonic from existing key
-      // Use first 11 bytes of secret key as entropy (12th will be checksum)
-      uint8_t entropy[12];
-      memcpy(entropy, sk, 11);  // Only copy 11 bytes
-      entropy[11] = 0;  // Zero out 12th byte (will be set by generateMnemonic)
-      generateMnemonic(entropy, mnemonic);
-      
-      // Delete old mnemonic and store new one
-      prefs.remove("mnemonic");  // Clear old version first
-      
-      String mnemonicStr = "";
-      for (int i = 0; i < 12; i++) {
-        if (i > 0) mnemonicStr += " ";
-        mnemonicStr += mnemonic[i];
-      }
-      prefs.putString("mnemonic", mnemonicStr);
-      Serial.println("[Key] Generated NEW mnemonic for existing key");
     }
     return true;
   }
-  
-  // Generate new key with mnemonic
+  return false;
+}
+
+// Recover wallet from mnemonic phrase
+inline bool recoverFromMnemonic(Preferences& prefs, String words[12], 
+                                 uint8_t sk[32], uint8_t pk[32]) {
+  // Validate and convert mnemonic to entropy
   uint8_t entropy[12];
-  esp_fill_random(entropy, 12);  // SECURITY: Hardware RNG
-  
-  // Generate mnemonic from entropy
-  generateMnemonic(entropy, mnemonic);
+  if (!mnemonicToEntropy(words, entropy)) {
+    return false;  // Invalid mnemonic
+  }
   
   // Derive key from entropy
   entropyToKey(entropy, sk);
   ed25519_publickey(sk, pk);
   
-  // Store key and mnemonic
-  prefs.putBytes("sk", sk, 32);
-  
-  // Store mnemonic as space-separated string
-  String mnemonicStr = "";
-  for (int i = 0; i < 12; i++) {
-    if (i > 0) mnemonicStr += " ";
-    mnemonicStr += mnemonic[i];
-  }
-  prefs.putString("mnemonic", mnemonicStr);
-  
-  return true;
-}
-
-// Recover wallet from mnemonic
-inline bool recoverFromMnemonic(Preferences& prefs, const String mnemonic[12], 
-                                 uint8_t sk[32], uint8_t pk[32]) {
-  uint8_t entropy[12];
-  
-  // Convert mnemonic to entropy and verify checksum
-  if (!mnemonicToEntropy(mnemonic, entropy)) {
-    return false;  // Invalid mnemonic or bad checksum
-  }
-  
-  // Derive key
-  entropyToKey(entropy, sk);
-  ed25519_publickey(sk, pk);
-  
-  // Store recovered key
+  // Store as plain key (will be encrypted on next boot with PIN migration)
   prefs.putBytes("sk", sk, 32);
   
   // Store mnemonic
   String mnemonicStr = "";
   for (int i = 0; i < 12; i++) {
     if (i > 0) mnemonicStr += " ";
-    mnemonicStr += mnemonic[i];
+    mnemonicStr += words[i];
   }
   prefs.putString("mnemonic", mnemonicStr);
+  
+  // Remove any encrypted key to force re-encryption on next boot
+  prefs.remove("enc_sk");
+  prefs.remove("sk_iv");
+  prefs.remove("pin_salt");
   
   return true;
 }
