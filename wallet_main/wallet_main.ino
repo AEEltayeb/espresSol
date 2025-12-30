@@ -11,6 +11,13 @@
 #include "display_ui.h"
 #include "transaction_handler.h"
 #include "crypto/ed25519.h"
+#include "crypto/mnemonic.h"
+
+// WebSocket server for mobile app connectivity
+#define USE_WEBSOCKET_SERVER 1
+#if USE_WEBSOCKET_SERVER
+#include <WebSocketsServer.h>
+#endif
 
 // ===== TLS CERTIFICATE (Self-signed) =====
 // Valid for: ESP32 Hardware Wallet
@@ -104,6 +111,13 @@ const uint32_t MSG_VALIDITY_WINDOW = 60000;  // 60 seconds
 // ===== SESSION TIMEOUT =====
 unsigned long last_activity_time = 0;
 const unsigned long SESSION_TIMEOUT = 300000;  // 5 minutes auto-lock
+
+// ===== WEBSOCKET SERVER (for mobile app) =====
+#if USE_WEBSOCKET_SERVER
+WebSocketsServer wsServer(8444);
+void handleWSMessage(uint8_t num, uint8_t* payload, size_t length);  // Forward declaration
+void wsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);  // Forward declaration
+#endif
 
 // ===== UTILITY FUNCTIONS =====
 // bytesToHex is defined in transaction_handler.h
@@ -678,7 +692,117 @@ void handleSerialCommand() {
       sendEncryptedUSB(response);
     }
     else if (strcmp(cmd, "PING") == 0) {
-      sendEncryptedUSB("{\"ok\":true,\"msg\":\"pong\"}");
+      sendEncryptedUSB("{\"ok\":true,\"pong\":true}");
+    }
+    else if (strcmp(cmd, "SIGN") == 0) {
+      const char* msgHex = doc["msg"];
+      Serial.println("[CMD] SIGN request from USB");
+      
+      // Decode hex message
+      size_t hexLen = strlen(msgHex);
+      size_t msgLen = hexLen / 2;
+      uint8_t* msg = new uint8_t[msgLen];
+      hexToBytes(msgHex, msg, msgLen);
+      
+      // Calculate hash for display
+      uint8_t msgHash[32];
+      mbedtls_sha256(msg, msgLen, msgHash, 0);
+      
+      // Show details
+      u8g2.clearBuffer();
+      u8g2.setFont(u8g2_font_6x10_tf);
+      u8g2.drawStr(0, 12, "USB SIGN REQUEST");
+      
+      char sizeStr[32];
+      snprintf(sizeStr, sizeof(sizeStr), "Size: %d bytes", msgLen);
+      u8g2.drawStr(0, 26, sizeStr);
+      
+      char hashStr[32];
+      snprintf(hashStr, sizeof(hashStr), "Hash: %02x%02x%02x...", 
+               msgHash[0], msgHash[1], msgHash[2]);
+      u8g2.drawStr(0, 40, hashStr);
+      
+      u8g2.setFont(u8g2_font_9x15_tf);
+      u8g2.drawStr(0, 58, "OK=Sign X=Reject");
+      u8g2.sendBuffer();
+      
+      int decision = waitForDecision();
+      
+      if (decision == 1) {
+        uint8_t sig[64];
+        ed25519_sign(msg, msgLen, ed25519_sk, ed25519_pk, sig);
+        String sigB58 = bytesToBase58(sig, 64);
+        String resp = "{\"ok\":true,\"sig_b58\":\"" + sigB58 + "\"}";
+        sendEncryptedUSB(resp);
+        drawCentered("Signed!", 0);
+      } else {
+        sendEncryptedUSB("{\"ok\":false,\"error\":\"rejected\"}");
+        drawCentered("Rejected", 0);
+      }
+      delete[] msg;
+      delay(1000);
+      drawCentered("USB Mode", -10);
+      drawCentered("Connected", 10);
+    }
+    else if (strcmp(cmd, "SHOW_MNEMONIC") == 0) {
+      displayMnemonic();
+      sendEncryptedUSB("{\"ok\":true}");
+      // Restore screen
+      drawCentered("USB Mode", -10);
+      drawCentered("Connected", 10);
+    }
+    else if (strcmp(cmd, "SET_WIFI") == 0) {
+      String ssid = doc["ssid"];
+      String pass = doc["password"];
+      if (ssid.length() > 0) {
+        Preferences prefs;
+        prefs.begin("wifi", false);
+        prefs.putString("ssid", ssid);
+        prefs.putString("password", pass);
+        prefs.end();
+        sendEncryptedUSB("{\"ok\":true}");
+        delay(500);
+        ESP.restart();
+      } else {
+        sendEncryptedUSB("{\"ok\":false,\"error\":\"empty_ssid\"}");
+      }
+    }
+    else if (strcmp(cmd, "RECOVER") == 0) {
+      String words[12];
+      bool hasWords = true;
+      for (int i=0; i<12; i++) {
+        String key = "word" + String(i);
+        if (!doc.containsKey(key)) {
+          hasWords = false;
+          break;
+        }
+        words[i] = doc[key].as<String>();
+      }
+      
+      if (hasWords) {
+        drawCentered("Recovering...", 0);
+        uint8_t entropy[32];
+        mnemonicToEntropy(words, entropy);
+        
+        uint8_t sk[32], pk[32];
+        entropyToKey(entropy, sk);
+        ed25519_publickey(sk, pk);
+        
+        if (!pin_verified) {
+           sendEncryptedUSB("{\"ok\":false,\"error\":\"device_locked\"}");
+        } else {
+           if (generateAndStoreEncryptedKey(prefs, pin_key, pin_salt, sk, pk, words)) {
+             sendEncryptedUSB("{\"ok\":true}");
+             drawCentered("Recovered!", 0);
+             delay(2000);
+             ESP.restart();
+           } else {
+             sendEncryptedUSB("{\"ok\":false,\"error\":\"storage_failed\"}");
+           }
+        }
+      } else {
+        sendEncryptedUSB("{\"ok\":false,\"error\":\"missing_words\"}");
+      }
     }
     else {
       sendEncryptedUSB("{\"ok\":false,\"error\":\"unknown_cmd\"}");
@@ -1445,9 +1569,16 @@ void setup() {
 #endif
     Serial.print("[Server] Listening on port "); Serial.println(SERVER_PORT);
     
+#if USE_WEBSOCKET_SERVER
+    // Start WebSocket server for mobile app
+    wsServer.begin();
+    wsServer.onEvent(wsEvent);
+    Serial.println("[WS] WebSocket server started on port 8444");
+#endif
+    
     String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
 #if USE_TLS_SERVER
-    drawCentered("TLS Ready", -10);
+    drawCentered("TLS+WS Ready", -10);
 #else
     drawCentered("WiFi Ready", -10);
 #endif
@@ -1495,12 +1626,141 @@ void loop() {
                 }
                 
                 const char* cmd = doc["cmd"] | "";
+                
                 if (strcmp(cmd, "PUBKEY") == 0) {
                   String pubkeyB58 = bytesToBase58(ed25519_pk, 32);
                   String resp = "{\"ok\":true,\"pubkey\":\"" + pubkeyB58 + "\"}";
                   tlsClient->println(resp);
-                } else if (strcmp(cmd, "PING") == 0) {
+                } 
+                else if (strcmp(cmd, "PING") == 0) {
                   tlsClient->println("{\"ok\":true,\"pong\":true}");
+                }
+                else if (strcmp(cmd, "SIGN") == 0) {
+                  const char* msgHex = doc["msg"];
+                  Serial.println("[CMD] SIGN request");
+                  
+                  // Decode hex message
+                  size_t hexLen = strlen(msgHex);
+                  size_t msgLen = hexLen / 2;
+                  uint8_t* msg = new uint8_t[msgLen];
+                  hexToBytes(msgHex, msg, msgLen);
+                  
+                  // Calculate hash for display
+                  uint8_t msgHash[32];
+                  mbedtls_sha256(msg, msgLen, msgHash, 0);
+                  
+                  // Show details
+                  u8g2.clearBuffer();
+                  u8g2.setFont(u8g2_font_6x10_tf);
+                  u8g2.drawStr(0, 12, "SIGN REQUEST");
+                  
+                  char sizeStr[32];
+                  snprintf(sizeStr, sizeof(sizeStr), "Size: %d bytes", msgLen);
+                  u8g2.drawStr(0, 26, sizeStr);
+                  
+                  char hashStr[32];
+                  snprintf(hashStr, sizeof(hashStr), "Hash: %02x%02x%02x...", 
+                           msgHash[0], msgHash[1], msgHash[2]);
+                  u8g2.drawStr(0, 40, hashStr);
+                  
+                  u8g2.setFont(u8g2_font_9x15_tf);
+                  u8g2.drawStr(0, 58, "OK=Sign X=Reject");
+                  u8g2.sendBuffer();
+                  
+                  int decision = waitForDecision();
+                  
+                  StaticJsonDocument<256> resp;
+                  if (decision == 1) {
+                    uint8_t sig[64];
+                    ed25519_sign(msg, msgLen, ed25519_sk, ed25519_pk, sig);
+                    String sigB58 = bytesToBase58(sig, 64);
+                    resp["ok"] = true;
+                    resp["sig_b58"] = sigB58;
+                    drawCentered("Signed!", 0);
+                  } else {
+                    resp["ok"] = false;
+                    resp["error"] = "rejected";
+                    drawCentered("Rejected", 0);
+                  }
+                  delete[] msg;
+                  
+                  String out; serializeJson(resp, out);
+                  tlsClient->println(out);
+                  delay(1000);
+                  // Refresh idle screen
+                  String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
+                  drawCentered(ipMsg.c_str(), 10);
+                }
+                else if (strcmp(cmd, "SHOW_MNEMONIC") == 0) {
+                  displayMnemonic();
+                  tlsClient->println("{\"ok\":true}");
+                  // Restore screen
+                  String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
+                  drawCentered(ipMsg.c_str(), 10);
+                }
+                else if (strcmp(cmd, "SET_WIFI") == 0) {
+                  String ssid = doc["ssid"];
+                  String pass = doc["password"];
+                  if (ssid.length() > 0) {
+                    prefs.putString("wifi_ssid", ssid);
+                    prefs.putString("wifi_pass", pass);
+                    tlsClient->println("{\"ok\":true}");
+                    delay(500);
+                    ESP.restart();
+                  } else {
+                    tlsClient->println("{\"ok\":false,\"error\":\"empty_ssid\"}");
+                  }
+                }
+                else if (strcmp(cmd, "RECOVER") == 0) {
+                  // Recovery protocol: PC sends "RECOVER" check, but current python sends words immediately
+                  // Let's handle the words if they are present
+                  String words[12];
+                  bool hasWords = true;
+                  for (int i=0; i<12; i++) {
+                    String key = "word" + String(i);
+                    if (!doc.containsKey(key)) {
+                      hasWords = false;
+                      break;
+                    }
+                    words[i] = doc[key].as<String>();
+                  }
+                  
+                  if (hasWords) {
+                    drawCentered("Recovering...", 0);
+                    // Generate new key from mnemonic
+                    uint8_t entropy[32]; // Not used but needed by API
+                    mnemonicToEntropy(words, entropy);
+                    
+                    uint8_t sk[32], pk[32];
+                    entropyToKey(entropy, sk);
+                    ed25519_publickey(sk, pk);
+                    
+                    // We need PIN to re-encrypt
+                    // This is tricky - we need to ask user for PIN on device
+                    // Or reuse existing PIN if verified? 
+                    // Let's assume we reuse existing PIN if verified, otherwise ask
+                    if (!pin_verified) {
+                       // This flows is complex for remote recovery.
+                       // For now, let's assume device is unlocked (pin_verified=true)
+                       // If not, we should reject or ask for PIN
+                       tlsClient->println("{\"ok\":false,\"error\":\"device_locked\"}");
+                    } else {
+                       // Re-encrypt and store
+                       if (generateAndStoreEncryptedKey(prefs, pin_key, pin_salt, sk, pk, words)) {
+                         tlsClient->println("{\"ok\":true}");
+                         drawCentered("Recovered!", 0);
+                         delay(2000);
+                         ESP.restart();
+                       } else {
+                         tlsClient->println("{\"ok\":false,\"error\":\"storage_failed\"}");
+                       }
+                    }
+                  } else {
+                    tlsClient->println("{\"ok\":false,\"error\":\"missing_words\"}");
+                  }
+                }
+                else {
+                  tlsClient->println("{\"ok\":false,\"error\":\"unknown_cmd\"}");
                 }
               }
             }
@@ -1522,6 +1782,11 @@ void loop() {
       last_activity_time = millis();  // Reset activity timer
     }
 #endif
+
+#if USE_WEBSOCKET_SERVER
+    // Handle WebSocket connections (mobile app)
+    wsServer.loop();
+#endif
   }
   
   // Session timeout - auto-lock after inactivity
@@ -1539,3 +1804,188 @@ void loop() {
   delay(10);
 }
 
+// ===== WEBSOCKET HANDLERS (for mobile app) =====
+#if USE_WEBSOCKET_SERVER
+
+void wsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED:
+      Serial.printf("[WS] Client #%u disconnected\n", num);
+      break;
+      
+    case WStype_CONNECTED: {
+      IPAddress ip = wsServer.remoteIP(num);
+      Serial.printf("[WS] Client #%u connected from %s\n", num, ip.toString().c_str());
+      drawCentered("Mobile Connected!", 0);
+      delay(500);
+      String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
+      drawCentered("TLS+WS Ready", -10);
+      drawCentered(ipMsg.c_str(), 10);
+      break;
+    }
+    
+    case WStype_TEXT:
+      handleWSMessage(num, payload, length);
+      break;
+      
+    default:
+      break;
+  }
+}
+
+void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
+  StaticJsonDocument<2048> doc;
+  DeserializationError err = deserializeJson(doc, payload, length);
+  
+  if (err) {
+    wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"invalid_json\"}");
+    return;
+  }
+  
+  const char* cmd = doc["cmd"] | "";
+  Serial.print("[WS] Command: "); Serial.println(cmd);
+  last_activity_time = millis();  // Reset activity timer
+  
+  // PUBKEY
+  if (strcmp(cmd, "PUBKEY") == 0) {
+    String pubkeyB58 = bytesToBase58(ed25519_pk, 32);
+    String resp = "{\"ok\":true,\"pubkey\":\"" + pubkeyB58 + "\"}";
+    wsServer.sendTXT(num, resp);
+  }
+  // PING
+  else if (strcmp(cmd, "PING") == 0) {
+    wsServer.sendTXT(num, "{\"ok\":true,\"pong\":true}");
+  }
+  // SIGN
+  else if (strcmp(cmd, "SIGN") == 0) {
+    if (!pin_verified) {
+      wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"device_locked\"}");
+      return;
+    }
+    
+    const char* msgHex = doc["msg"];
+    if (!msgHex) {
+      wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"missing_msg\"}");
+      return;
+    }
+    
+    size_t hexLen = strlen(msgHex);
+    size_t msgLen = hexLen / 2;
+    uint8_t* msg = new uint8_t[msgLen];
+    hexToBytes(msgHex, msg, msgLen);
+    
+    uint8_t msgHash[32];
+    mbedtls_sha256(msg, msgLen, msgHash, 0);
+    
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 12, "MOBILE SIGN REQ");
+    char sizeStr[32];
+    snprintf(sizeStr, sizeof(sizeStr), "Size: %d bytes", msgLen);
+    u8g2.drawStr(0, 26, sizeStr);
+    char hashStr[32];
+    snprintf(hashStr, sizeof(hashStr), "Hash: %02x%02x%02x...", msgHash[0], msgHash[1], msgHash[2]);
+    u8g2.drawStr(0, 40, hashStr);
+    u8g2.setFont(u8g2_font_9x15_tf);
+    u8g2.drawStr(0, 58, "OK=Sign X=Reject");
+    u8g2.sendBuffer();
+    
+    int decision = waitForDecision();
+    
+    StaticJsonDocument<256> resp;
+    if (decision == 1) {
+      uint8_t sig[64];
+      ed25519_sign(msg, msgLen, ed25519_sk, ed25519_pk, sig);
+      String sigB58 = bytesToBase58(sig, 64);
+      resp["ok"] = true;
+      resp["sig_b58"] = sigB58;
+      drawCentered("Signed!", 0);
+    } else {
+      resp["ok"] = false;
+      resp["error"] = "rejected";
+      drawCentered("Rejected", 0);
+    }
+    delete[] msg;
+    
+    String out;
+    serializeJson(resp, out);
+    wsServer.sendTXT(num, out);
+    delay(1000);
+    String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
+    drawCentered("TLS+WS Ready", -10);
+    drawCentered(ipMsg.c_str(), 10);
+  }
+  // SHOW_MNEMONIC
+  else if (strcmp(cmd, "SHOW_MNEMONIC") == 0) {
+    if (!pin_verified) {
+      wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"device_locked\"}");
+      return;
+    }
+    displayMnemonic();
+    wsServer.sendTXT(num, "{\"ok\":true}");
+    String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
+    drawCentered(ipMsg.c_str(), 10);
+  }
+  // SET_WIFI
+  else if (strcmp(cmd, "SET_WIFI") == 0) {
+    String ssid = doc["ssid"];
+    String pass = doc["password"];
+    if (ssid.length() > 0) {
+      Preferences wifiPrefs;
+      wifiPrefs.begin("wifi", false);
+      wifiPrefs.putString("ssid", ssid);
+      wifiPrefs.putString("password", pass);
+      wifiPrefs.end();
+      wsServer.sendTXT(num, "{\"ok\":true}");
+      delay(500);
+      ESP.restart();
+    } else {
+      wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"empty_ssid\"}");
+    }
+  }
+  // RECOVER
+  else if (strcmp(cmd, "RECOVER") == 0) {
+    if (!pin_verified) {
+      wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"device_locked\"}");
+      return;
+    }
+    
+    String words[12];
+    bool hasWords = true;
+    for (int i = 0; i < 12; i++) {
+      String key = "word" + String(i);
+      if (!doc.containsKey(key)) {
+        hasWords = false;
+        break;
+      }
+      words[i] = doc[key].as<String>();
+    }
+    
+    if (hasWords) {
+      drawCentered("Recovering...", 0);
+      uint8_t entropy[32];
+      mnemonicToEntropy(words, entropy);
+      
+      uint8_t sk[32], pk[32];
+      entropyToKey(entropy, sk);
+      ed25519_publickey(sk, pk);
+      
+      if (generateAndStoreEncryptedKey(prefs, pin_key, pin_salt, sk, pk, words)) {
+        wsServer.sendTXT(num, "{\"ok\":true}");
+        drawCentered("Recovered!", 0);
+        delay(2000);
+        ESP.restart();
+      } else {
+        wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"storage_failed\"}");
+      }
+    } else {
+      wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"missing_words\"}");
+    }
+  }
+  // Unknown
+  else {
+    wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"unknown_cmd\"}");
+  }
+}
+
+#endif  // USE_WEBSOCKET_SERVER
