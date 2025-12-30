@@ -48,11 +48,35 @@ inline void drawScrollable(const String& title, const String& body) {
 }
 
 inline int waitForDecision() {
+  Serial.println("[BTN] Waiting for button press (OK=approve, DOWN=reject)...");
+  Serial.print("[BTN] GPIO OK="); Serial.print(BTN_OK);
+  Serial.print(" DOWN="); Serial.println(BTN_DOWN);
+  
   unsigned long t0 = millis(), T=20000;
+  int lastPrint = 0;
   while (millis()-t0 < T) {
-    if (digitalRead(BTN_OK)==LOW) return 1;
-    if (digitalRead(BTN_DOWN)==LOW) return -1;
+    int okState = digitalRead(BTN_OK);
+    int downState = digitalRead(BTN_DOWN);
+    
+    // Print button states every 2 seconds
+    if ((millis()-t0)/2000 > lastPrint) {
+      lastPrint = (millis()-t0)/2000;
+      Serial.print("[BTN] OK="); Serial.print(okState);
+      Serial.print(" DOWN="); Serial.print(downState);
+      Serial.print(" (press LOW to activate, "); 
+      Serial.print(20 - (millis()-t0)/1000); Serial.println("s left)");
+    }
+    
+    if (okState == LOW) {
+      Serial.println("[BTN] OK pressed - APPROVED!");
+      return 1;
+    }
+    if (downState == LOW) {
+      Serial.println("[BTN] DOWN pressed - REJECTED!");
+      return -1;
+    }
     delay(40);
   }
+  Serial.println("[BTN] TIMEOUT - no button pressed in 20 seconds");
   return 0;
 }

@@ -1,0 +1,983 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+#include <U8g2lib.h>
+#include "mbedtls/base64.h"
+#include "mbedtls/gcm.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/ctr_drbg.h"
+#include "key_storage.h"
+#include "display_ui.h"
+#include "crypto/ed25519.h"
+
+// ===== CONFIGURATION =====
+// WiFi credentials now stored in NVS, not hardcoded
+// Hold DOWN button during boot to enter WiFi setup mode
+const uint16_t SERVER_PORT = 8443;
+
+// ===== HARDWARE PINS =====
+// Your button wiring:
+// - White button (GPIO 4)  = OK/Confirm
+// - Red button (GPIO 23)   = Reject/Cancel  
+// - Blue button 1 (GPIO 19) = UP scroll
+// - Blue button 2 (GPIO 18) = DOWN scroll
+const int BTN_OK = 4;      // White button - approve transaction
+const int BTN_DOWN = 23;   // Red button - reject transaction
+const int BTN_UP = 19;     // Blue button 1 - scroll up
+
+// ===== GLOBAL OBJECTS =====
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+WiFiServer wifiServer(SERVER_PORT);
+Preferences prefs;
+
+uint8_t ed25519_sk[32];
+uint8_t ed25519_pk[32];
+String mnemonicWords[12];  // Backup phrase
+
+// ===== AES-GCM SECURE CHANNEL =====
+uint8_t aes_key[16];  // Shared AES key (exchanged during pairing)
+uint8_t channel_salt[8];  // Salt for nonce generation
+uint32_t tx_counter = 1;
+
+// Initialize with zeros - will be set during ECDH key exchange
+bool secure_channel_ready = false;
+
+// ===== USB SERIAL MODE =====
+bool usb_mode_active = false;
+unsigned long last_serial_activity = 0;
+
+// ===== UTILITY FUNCTIONS =====
+String bytesToHex(const uint8_t* data, size_t len) {
+  const char* hex = "0123456789abcdef";
+  String s; s.reserve(len*2);
+  for (size_t i=0; i<len; ++i) { 
+    s += hex[(data[i]>>4)&0xF]; 
+    s += hex[data[i]&0xF]; 
+  }
+  return s;
+}
+
+void hexToBytes(const char* hex, uint8_t* out, size_t outLen) {
+  for (size_t i = 0; i < outLen; i++) {
+    char h = hex[i*2];
+    char l = hex[i*2+1];
+    uint8_t hi = (h >= 'a') ? (h - 'a' + 10) : ((h >= 'A') ? (h - 'A' + 10) : (h - '0'));
+    uint8_t lo = (l >= 'a') ? (l - 'a' + 10) : ((l >= 'A') ? (l - 'A' + 10) : (l - '0'));
+    out[i] = (hi << 4) | lo;
+  }
+}
+
+String bytesToBase58(const uint8_t* data, size_t len) {
+  const char* ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  String result = "";
+  uint8_t temp[64];
+  memcpy(temp, data, len);
+  size_t tempLen = len;
+  
+  while (tempLen > 0) {
+    uint32_t remainder = 0;
+    size_t newLen = 0;
+    for (size_t i = 0; i < tempLen; i++) {
+      uint32_t digit = (remainder << 8) + temp[i];
+      temp[newLen] = digit / 58;
+      remainder = digit % 58;
+      if (temp[newLen] > 0 || newLen > 0) newLen++;
+    }
+    result = String(ALPHABET[remainder]) + result;
+    tempLen = newLen;
+  }
+  
+  for (size_t i = 0; i < len && data[i] == 0; i++) {
+    result = "1" + result;
+  }
+  
+  return result;
+}
+
+// ===== AES-GCM ENCRYPTION (SecureChannel compatible) =====
+bool encryptAESGCM(const uint8_t* plaintext, size_t ptLen, 
+                   uint8_t* nonce, uint8_t* ciphertext, uint8_t* tag) {
+  // Build nonce: salt (8 bytes) + counter (4 bytes)
+  memcpy(nonce, channel_salt, 8);
+  nonce[8] = (tx_counter >> 24) & 0xFF;
+  nonce[9] = (tx_counter >> 16) & 0xFF;
+  nonce[10] = (tx_counter >> 8) & 0xFF;
+  nonce[11] = tx_counter & 0xFF;
+  tx_counter++;
+  
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  
+  int ret = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, aes_key, 128);
+  if (ret != 0) {
+    mbedtls_gcm_free(&gcm);
+    return false;
+  }
+  
+  ret = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, ptLen,
+                                   nonce, 12, NULL, 0,
+                                   plaintext, ciphertext,
+                                   16, tag);
+  
+  mbedtls_gcm_free(&gcm);
+  return ret == 0;
+}
+
+bool decryptAESGCM(const uint8_t* nonce, const uint8_t* ciphertext, size_t ctLen,
+                   const uint8_t* tag, uint8_t* plaintext) {
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  
+  int ret = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, aes_key, 128);
+  if (ret != 0) {
+    mbedtls_gcm_free(&gcm);
+    return false;
+  }
+  
+  ret = mbedtls_gcm_auth_decrypt(&gcm, ctLen, nonce, 12, NULL, 0,
+                                  tag, 16, ciphertext, plaintext);
+  
+  mbedtls_gcm_free(&gcm);
+  return ret == 0;
+}
+
+// Send encrypted JSON response
+void sendEncryptedResponse(WiFiClient& client, const char* jsonStr) {
+  size_t jsonLen = strlen(jsonStr);
+  uint8_t nonce[12];
+  uint8_t* ciphertext = new uint8_t[jsonLen];
+  uint8_t tag[16];
+  
+  if (!encryptAESGCM((const uint8_t*)jsonStr, jsonLen, nonce, ciphertext, tag)) {
+    Serial.println("[ENC] Encryption failed!");
+    delete[] ciphertext;
+    return;
+  }
+  
+  // Build frame: nonce || ciphertext || tag
+  size_t frameLen = 12 + jsonLen + 16;
+  uint8_t* frame = new uint8_t[frameLen];
+  memcpy(frame, nonce, 12);
+  memcpy(frame + 12, ciphertext, jsonLen);
+  memcpy(frame + 12 + jsonLen, tag, 16);
+  
+  // Base64 encode
+  size_t b64Len = 0;
+  mbedtls_base64_encode(NULL, 0, &b64Len, frame, frameLen);
+  uint8_t* b64 = new uint8_t[b64Len + 1];
+  mbedtls_base64_encode(b64, b64Len + 1, &b64Len, frame, frameLen);
+  
+  // Send as ENC: frame
+  client.print("ENC:");
+  client.print((char*)b64);
+  client.print("\n");
+  
+  delete[] ciphertext;
+  delete[] frame;
+  delete[] b64;
+  
+  Serial.println("[ENC] Sent encrypted response");
+}
+
+// Receive and decrypt JSON command
+bool recvDecryptedJson(WiFiClient& client, StaticJsonDocument<1024>& doc) {
+  String line = client.readStringUntil('\n');
+  line.trim();
+  
+  if (line.length() == 0) return false;
+  
+  // Check if encrypted (ENC: prefix) or plain JSON
+  if (!line.startsWith("ENC:")) {
+    // Plain JSON (for initial pairing)
+    DeserializationError err = deserializeJson(doc, line);
+    return err == DeserializationError::Ok;
+  }
+  
+  // Encrypted frame
+  String b64Data = line.substring(4);
+  
+  // Base64 decode
+  size_t rawLen = 0;
+  mbedtls_base64_decode(NULL, 0, &rawLen, (const uint8_t*)b64Data.c_str(), b64Data.length());
+  uint8_t* raw = new uint8_t[rawLen];
+  mbedtls_base64_decode(raw, rawLen, &rawLen, (const uint8_t*)b64Data.c_str(), b64Data.length());
+  
+  if (rawLen < 28) {  // 12 nonce + minimum 0 ct + 16 tag
+    delete[] raw;
+    return false;
+  }
+  
+  // Parse frame: nonce || ciphertext || tag
+  uint8_t* nonce = raw;
+  size_t ctLen = rawLen - 12 - 16;
+  uint8_t* ct = raw + 12;
+  uint8_t* tag = raw + 12 + ctLen;
+  
+  uint8_t* plaintext = new uint8_t[ctLen + 1];
+  bool success = decryptAESGCM(nonce, ct, ctLen, tag, plaintext);
+  
+  if (success) {
+    plaintext[ctLen] = '\0';
+    DeserializationError err = deserializeJson(doc, (char*)plaintext);
+    success = (err == DeserializationError::Ok);
+  }
+  
+  delete[] raw;
+  delete[] plaintext;
+  return success;
+}
+
+// ===== USB SERIAL HANDLERS =====
+bool usb_paired = false;
+uint8_t usb_aes_key[16];  // 128-bit key for AES-GCM (SecureChannel compatible)
+uint8_t usb_nonce_counter = 0;
+
+// ECDH for USB pairing - using secp256r1 curve
+#include "mbedtls/ecdh.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/ctr_drbg.h"
+
+void sendUSBReady() {
+  Serial.println("USB_READY");
+  Serial.flush();
+}
+
+void sendEncryptedUSB(const String& json);  // Forward declaration
+
+void handleUSBPairing() {
+  mbedtls_ecdh_context ecdh;
+  mbedtls_entropy_context entropy;
+  mbedtls_ctr_drbg_context ctr_drbg;
+  
+  mbedtls_ecdh_init(&ecdh);
+  mbedtls_entropy_init(&entropy);
+  mbedtls_ctr_drbg_init(&ctr_drbg);
+  
+  const char *pers = "ecdh_pairing";
+  mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
+                        (const unsigned char *)pers, strlen(pers));
+  
+  // Setup ECDH using internal structure (ESP32 mbedtls compatibility)
+  mbedtls_ecp_group grp;
+  mbedtls_mpi d;  // Private key
+  mbedtls_ecp_point Q;  // Public key
+  
+  mbedtls_ecp_group_init(&grp);
+  mbedtls_mpi_init(&d);
+  mbedtls_ecp_point_init(&Q);
+  
+  mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
+  mbedtls_ecdh_gen_public(&grp, &d, &Q, mbedtls_ctr_drbg_random, &ctr_drbg);
+  
+  // Export wallet public key (uncompressed point format)
+  unsigned char wallet_pub[65];
+  size_t olen = 0;
+  mbedtls_ecp_point_write_binary(&grp, &Q, MBEDTLS_ECP_PF_UNCOMPRESSED,
+                                  &olen, wallet_pub, sizeof(wallet_pub));
+  
+  // Wait for PC public key
+  Serial.println("USB_READY");
+  Serial.flush();
+  
+  String line = "";
+  unsigned long start = millis();
+  while (millis() - start < 30000) {  // 30 second timeout
+    if (Serial.available()) {
+      char c = Serial.read();
+      if (c == '\n') {
+        StaticJsonDocument<512> doc;
+        DeserializationError err = deserializeJson(doc, line);
+        
+        if (err == DeserializationError::Ok) {
+          const char* action = doc["action"] | "";
+          
+          if (strcmp(action, "pc_pub") == 0) {
+            const char* pc_pub_hex = doc["pc_pub"] | "";
+            
+            // Parse PC public key
+            unsigned char pc_pub[65];
+            hexToBytes(pc_pub_hex, pc_pub, 65);
+            
+            // Load PC public key
+            mbedtls_ecp_point pc_point;
+            mbedtls_ecp_point_init(&pc_point);
+            mbedtls_ecp_point_read_binary(&grp, &pc_point, pc_pub, 65);
+            
+            // Compute shared secret
+            mbedtls_mpi shared_secret;
+            mbedtls_mpi_init(&shared_secret);
+            mbedtls_ecdh_compute_shared(&grp, &shared_secret, &pc_point, &d,
+                                         mbedtls_ctr_drbg_random, &ctr_drbg);
+            
+            // Export shared secret
+            unsigned char shared[32];
+            mbedtls_mpi_write_binary(&shared_secret, shared, 32);
+            
+            // Generate pairing code = SHA256(shared || wallet_pub || pc_pub) % 1000000
+            uint8_t hash_input[162];  // 32 + 65 + 65
+            memcpy(hash_input, shared, 32);
+            memcpy(hash_input + 32, wallet_pub, 65);
+            memcpy(hash_input + 97, pc_pub, 65);
+            
+            uint8_t code_hash[32];
+            mbedtls_sha256(hash_input, sizeof(hash_input), code_hash, 0);
+            
+            uint32_t code_num = ((uint32_t)code_hash[0] << 24) |
+                                 ((uint32_t)code_hash[1] << 16) |
+                                 ((uint32_t)code_hash[2] << 8) |
+                                 ((uint32_t)code_hash[3]);
+            code_num = code_num % 1000000;
+            
+            char code_str[7];
+            snprintf(code_str, sizeof(code_str), "%06lu", code_num);
+            
+            // Send wallet pubkey and pairing code
+            Serial.print("{\"status\":\"ok\",\"wallet_pub\":\"");
+            Serial.print(bytesToHex(wallet_pub, 65));
+            Serial.print("\",\"code\":\"");
+            Serial.print(code_str);
+            Serial.println("\"}");
+            Serial.flush();
+            
+            // Display pairing code on OLED
+            u8g2.clearBuffer();
+            u8g2.setFont(u8g2_font_9x15_tf);
+            u8g2.drawUTF8(0, 20, "USB Pairing");
+            u8g2.drawUTF8(0, 40, "Code:");
+            u8g2.setFont(u8g2_font_10x20_tf);
+            u8g2.drawUTF8(10, 60, code_str);
+            u8g2.sendBuffer();
+            
+            // Wait for user decision
+            drawCentered("Confirm pairing?", -10);
+            drawCentered("OK=Yes DOWN=No", 10);
+            
+            int decision = waitForDecision();
+            
+            if (decision == 1) {
+              // User approved
+              Serial.println("{\"action\":\"user\",\"decision\":\"allow\"}");
+              Serial.flush();
+              
+              // Derive 16-byte AES key (128-bit for SecureChannel compatibility)
+              uint8_t key_material[64];
+              memcpy(key_material, shared, 32);
+              memcpy(key_material + 32, "USBPAIRv1", 9);
+              
+              uint8_t temp_key[32];
+              mbedtls_sha256(key_material, 41, temp_key, 0);
+              
+              // Use first 16 bytes for AES-128-GCM (SecureChannel compatible)
+              memcpy(usb_aes_key, temp_key, 16);
+              
+              usb_paired = true;
+              drawCentered("USB Paired!", 0);
+              delay(1000);
+            } else {
+              Serial.println("{\"action\":\"user\",\"decision\":\"deny\"}");
+              Serial.flush();
+              drawCentered("Pairing Denied", 0);
+              delay(1000);
+            }
+            
+            mbedtls_ecp_point_free(&pc_point);
+            mbedtls_mpi_free(&shared_secret);
+            break;
+          }
+        }
+        line = "";
+      } else {
+        line += c;
+      }
+    }
+    delay(10);
+  }
+  
+  mbedtls_ecp_group_free(&grp);
+  mbedtls_mpi_free(&d);
+  mbedtls_ecp_point_free(&Q);
+  mbedtls_ecdh_free(&ecdh);
+  mbedtls_entropy_free(&entropy);
+  mbedtls_ctr_drbg_free(&ctr_drbg);
+}
+
+void handleSerialCommand() {
+  if (!Serial.available()) return;
+  
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  
+  if (line.length() == 0) return;
+  
+  // Check for encrypted message (SecureChannel format: "ENC:base64data")
+  if (line.startsWith("ENC:") && usb_paired) {
+    // Decrypt AES-GCM encrypted message
+    String encData = line.substring(4);
+    
+    // Decode base64
+    size_t outLen = 0;
+    unsigned char decoded[512];
+    mbedtls_base64_decode(decoded, sizeof(decoded), &outLen, 
+                          (const unsigned char*)encData.c_str(), encData.length());
+    
+    if (outLen < 28) { // 12-byte nonce + 16-byte tag minimum
+      Serial.println("{\"error\":\"invalid_encrypted\"}");
+      return;
+    }
+    
+    // Extract nonce (first 12 bytes) and tag (last 16 bytes)
+    uint8_t nonce[12];
+    memcpy(nonce, decoded, 12);
+    
+    size_t ciphertext_len = outLen - 12 - 16;
+    uint8_t* ciphertext = decoded + 12;
+    uint8_t tag[16];
+    memcpy(tag, decoded + 12 + ciphertext_len, 16);
+    
+    // Decrypt with AES-GCM
+    mbedtls_gcm_context gcm;
+    mbedtls_gcm_init(&gcm);
+    mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, usb_aes_key, 128);  // 128-bit key
+    
+    uint8_t plaintext[512];
+    int ret = mbedtls_gcm_auth_decrypt(&gcm, ciphertext_len, nonce, 12,
+                                        NULL, 0, tag, 16,
+                                        ciphertext, plaintext);
+    mbedtls_gcm_free(&gcm);
+    
+    if (ret != 0) {
+      Serial.println("{\"error\":\"decrypt_failed\"}");
+      return;
+    }
+    
+    plaintext[ciphertext_len] = '\0';
+    
+    // Parse decrypted JSON
+    StaticJsonDocument<1024> doc;
+    DeserializationError err = deserializeJson(doc, (const char*)plaintext);
+    
+    if (err != DeserializationError::Ok) {
+      Serial.println("{\"error\":\"invalid_json\"}");
+      return;
+    }
+    
+    // Handle decrypted command
+    const char* cmd = doc["cmd"] | "";
+    
+    if (strcmp(cmd, "PUBKEY") == 0) {
+      String pubkeyB58 = bytesToBase58(ed25519_pk, 32);
+      String response = "{\"ok\":true,\"pubkey\":\"" + pubkeyB58 + "\"}";
+      sendEncryptedUSB(response);
+    }
+    else if (strcmp(cmd, "PING") == 0) {
+      sendEncryptedUSB("{\"ok\":true,\"msg\":\"pong\"}");
+    }
+    else {
+      sendEncryptedUSB("{\"ok\":false,\"error\":\"unknown_cmd\"}");
+    }
+    
+    return;
+  }
+  
+  // Handle plain JSON (for pairing)
+  StaticJsonDocument<1024> doc;
+  DeserializationError err = deserializeJson(doc, line);
+  
+  if (err != DeserializationError::Ok) {
+    Serial.println("{\"error\":\"invalid_json\"}");
+    return;
+  }
+  
+  const char* action = doc["action"] | "";
+  const char* cmd = doc["cmd"] | "";
+  
+  // Handle pairing initiation
+  if (strcmp(action, "pc_pub") == 0 && !usb_paired) {
+    // Pairing is handled by handleUSBPairing()
+    return;
+  }
+  
+  // Handle encryption test
+  if (strcmp(action, "enc_test") == 0 && usb_paired) {
+    const char* iv_hex = doc["iv"] | "";
+    const char* plain = doc["plain"] | "";
+    
+    // Parse IV
+    uint8_t iv[16];
+    hexToBytes(iv_hex, iv, 16);
+    
+    // Encrypt using AES-CTR
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, usb_aes_key, 256);
+    
+    size_t nc_off = 0;
+    unsigned char stream_block[16] = {0};
+    size_t plain_len = strlen(plain);
+    unsigned char encrypted[128];
+    
+    mbedtls_aes_crypt_ctr(&aes, plain_len, &nc_off, iv, stream_block,
+                          (const unsigned char*)plain, encrypted);
+    
+    mbedtls_aes_free(&aes);
+    
+    // Send encrypted echo
+    Serial.print("{\"status\":\"ok\",\"echo\":\"");
+    Serial.print(bytesToHex(encrypted, plain_len));
+    Serial.println("\"}");
+    Serial.flush();
+    return;
+  }
+  
+  // Handle regular commands (before pairing)
+  if (strcmp(cmd, "PUBKEY") == 0) {
+    String pubkeyB58 = bytesToBase58(ed25519_pk, 32);
+    Serial.print("{\"ok\":true,\"pubkey\":\"");
+    Serial.print(pubkeyB58);
+    Serial.println("\"}");
+    Serial.flush();
+  }
+  else if (strcmp(cmd, "PING") == 0) {
+    Serial.println("{\"ok\":true,\"msg\":\"pong\"}");
+    Serial.flush();
+  }
+  
+  last_serial_activity = millis();
+  usb_mode_active = true;
+}
+
+// Send encrypted response over USB using AES-GCM
+void sendEncryptedUSB(const String& json) {
+  // Generate nonce
+  uint8_t nonce[12];
+  esp_fill_random(nonce, 12);
+  
+  // Encrypt with AES-GCM
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, usb_aes_key, 128);  // 128-bit key
+  
+  uint8_t ciphertext[512];
+  uint8_t tag[16];
+  
+  mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, json.length(),
+                             nonce, 12, NULL, 0,
+                             (const uint8_t*)json.c_str(), ciphertext,
+                             16, tag);
+  mbedtls_gcm_free(&gcm);
+  
+  // Combine: nonce + ciphertext + tag
+  uint8_t combined[12 + 512 + 16];
+  memcpy(combined, nonce, 12);
+  memcpy(combined + 12, ciphertext, json.length());
+  memcpy(combined + 12 + json.length(), tag, 16);
+  
+  // Base64 encode
+  size_t outLen = 0;
+  unsigned char encoded[1024];
+  mbedtls_base64_encode(encoded, sizeof(encoded), &outLen,
+                        combined, 12 + json.length() + 16);
+  
+  // Send with ENC: prefix
+  Serial.print("ENC:");
+  Serial.write(encoded, outLen);
+  Serial.println();
+  Serial.flush();
+}
+
+// ===== WIFI FUNCTIONS =====
+void connectWiFi() {
+  Preferences wifiPrefs;
+  wifiPrefs.begin("wifi", true);  // Read-only
+  
+  String ssid = wifiPrefs.getString("ssid", "");
+  String password = wifiPrefs.getString("password", "");
+  wifiPrefs.end();
+  
+  // If no WiFi configured, use defaults for initial setup
+  if (ssid.length() == 0) {
+    Serial.println("[WiFi] No credentials stored, using defaults");
+    ssid = "iPhone";  // Temporary - user should configure via command
+    password = "Ahmad123";
+  }
+  
+  Serial.println("\n[WiFi] Starting connection...");
+  Serial.print("[WiFi] SSID: "); Serial.println(ssid);
+  
+  WiFi.persistent(false);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(1000);
+  
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  
+  WiFi.begin(ssid.c_str(), password.c_str());
+  drawCentered("WiFi connecting...", 0);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 60) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] Connected!");
+    Serial.print("[WiFi] IP: "); Serial.println(WiFi.localIP());
+    drawCentered("WiFi connected", 0);
+    delay(1000);
+  } else {
+    Serial.println("\n[WiFi] FAILED!");
+    drawCentered("WiFi FAILED", 0);
+    delay(3000);
+    ESP.restart();
+  }
+}
+
+// ===== MNEMONIC DISPLAY =====
+void displayMnemonic() {
+  drawCentered("BACKUP PHRASE", -20);
+  drawCentered("Write these down!", 0);
+  delay(3000);
+  
+  // Show 2 words at a time on bottom rows only
+  for (int i = 0; i < 12; i += 2) {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_9x15_tf);
+    
+    String line1 = String(i+1) + ". " + mnemonicWords[i];
+    String line2 = String(i+2) + ". " + mnemonicWords[i+1];
+    
+    // Display only on bottom half (rows at y=45 and y=60)
+    u8g2.drawUTF8(0, 45, line1.c_str());
+    u8g2.drawUTF8(0, 60, line2.c_str());
+    u8g2.sendBuffer();
+    
+    delay(4000);  // Show each pair for 4 seconds
+  }
+  
+  drawCentered("Phrase shown!", 0);
+  delay(2000);
+}
+
+// ===== COMMAND HANDLERS =====
+void handlePubkeyCommand(WiFiClient& client) {
+  Serial.println("[CMD] PUBKEY request");
+  
+  String pubkeyB58 = bytesToBase58(ed25519_pk, 32);
+  
+  StaticJsonDocument<256> resp;
+  resp["ok"] = true;
+  resp["pubkey"] = pubkeyB58;
+  
+  String out;
+  serializeJson(resp, out);
+  
+  if (secure_channel_ready) {
+    sendEncryptedResponse(client, out.c_str());
+  } else {
+    client.println(out);
+  }
+  
+  Serial.print("[CMD] Sent pubkey: "); Serial.println(pubkeyB58);
+  drawCentered("Pubkey sent!", 0);
+}
+
+void handleSignCommand(WiFiClient& client, const char* msgHex) {
+  Serial.println("[CMD] SIGN request");
+  
+  drawCentered("Sign request...", 0);
+  delay(500);
+  
+  // Decode hex message
+  size_t hexLen = strlen(msgHex);
+  size_t msgLen = hexLen / 2;
+  uint8_t* msg = new uint8_t[msgLen];
+  hexToBytes(msgHex, msg, msgLen);
+  
+  // Show confirmation
+  drawCentered("Confirm TX?", -10);
+  drawCentered("OK=Yes DOWN=No", 10);
+  
+  int decision = waitForDecision();
+  
+  StaticJsonDocument<256> resp;
+  
+  if (decision != 1) {
+    Serial.println("[CMD] User rejected or timeout");
+    resp["ok"] = false;
+    resp["error"] = "rejected";
+    delete[] msg;
+    drawCentered("TX Rejected", 0);
+  } else {
+    // Sign the message
+    uint8_t sig[64];
+    ed25519_sign(msg, msgLen, ed25519_sk, ed25519_pk, sig);
+    delete[] msg;
+    
+    String sigB58 = bytesToBase58(sig, 64);
+    
+    resp["ok"] = true;
+    resp["sig_b58"] = sigB58;
+    
+    Serial.println("[CMD] Signature sent!");
+    drawCentered("TX Signed!", 0);
+  }
+  
+  String out;
+  serializeJson(resp, out);
+  
+  if (secure_channel_ready) {
+    sendEncryptedResponse(client, out.c_str());
+  } else {
+    client.println(out);
+  }
+  
+  delay(1000);
+}
+
+// Handle key exchange for secure channel
+void handleKeyExchange(WiFiClient& client, const uint8_t* peerPubkey) {
+  Serial.println("[SEC] Key exchange initiated");
+  
+  // Generate random salt for this session
+  esp_fill_random(channel_salt, 8);
+  
+  // For now, derive a simple shared key (in production, use proper ECDH)
+  // This is a simplified key derivation - combines our SK with peer pubkey
+  for (int i = 0; i < 16; i++) {
+    aes_key[i] = ed25519_sk[i] ^ peerPubkey[i % 32];
+  }
+  
+  secure_channel_ready = true;
+  tx_counter = 1;
+  
+  // Send our public key and salt
+  StaticJsonDocument<256> resp;
+  resp["ok"] = true;
+  resp["pubkey"] = bytesToHex(ed25519_pk, 32);
+  resp["salt"] = bytesToHex(channel_salt, 8);
+  
+  String out;
+  serializeJson(resp, out);
+  client.println(out);
+  
+  Serial.println("[SEC] Secure channel established!");
+  drawCentered("Secure Channel", -10);
+  drawCentered("Established!", 10);
+}
+
+// Handle mnemonic recovery
+void handleRecoverCommand(WiFiClient& client, StaticJsonDocument<1024>& doc) {
+  Serial.println("[CMD] RECOVER request");
+  
+  // Extract mnemonic words
+  String recoveryWords[12];
+  for (int i = 0; i < 12; i++) {
+    String key = "word" + String(i);
+    const char* word = doc[key] | "";
+    if (strlen(word) == 0) {
+      client.println("{\"ok\":false,\"error\":\"missing_words\"}");
+      return;
+    }
+    recoveryWords[i] = String(word);
+  }
+  
+  // Attempt recovery
+  Preferences tempPrefs;
+  tempPrefs.begin("wallet", false);
+  
+  if (recoverFromMnemonic(tempPrefs, recoveryWords, ed25519_sk, ed25519_pk)) {
+    // Store recovered words
+    for (int i = 0; i < 12; i++) {
+      mnemonicWords[i] = recoveryWords[i];
+    }
+    
+    tempPrefs.end();
+    
+    client.println("{\"ok\":true,\"message\":\"wallet_recovered\"}");
+    Serial.println("[CMD] Wallet recovered successfully!");
+    drawCentered("Wallet Recovered!", 0);
+    delay(2000);
+    ESP.restart();  // Restart to apply changes
+  } else {
+    tempPrefs.end();
+    client.println("{\"ok\":false,\"error\":\"invalid_mnemonic\"}");
+    Serial.println("[CMD] Invalid mnemonic");
+    drawCentered("Invalid phrase!", 0);
+  }
+}
+
+// ===== MAIN SERVER LOOP =====
+void handleClient(WiFiClient client) {
+  Serial.println("[Server] Client connected!");
+  drawCentered("PC Connected", 0);
+  
+  client.setTimeout(30);
+  
+  while (client.connected()) {
+    if (client.available()) {
+      StaticJsonDocument<1024> doc;
+      
+      if (!recvDecryptedJson(client, doc)) {
+        Serial.println("[Server] Failed to parse message");
+        continue;
+      }
+      
+      const char* cmd = doc["cmd"] | "";
+      Serial.print("[Server] Command: "); Serial.println(cmd);
+      
+      if (strcmp(cmd, "PUBKEY") == 0) {
+        handlePubkeyCommand(client);
+      } 
+      else if (strcmp(cmd, "SIGN") == 0) {
+        const char* msgHex = doc["msg"] | "";
+        handleSignCommand(client, msgHex);
+      }
+      else if (strcmp(cmd, "KEYEX") == 0) {
+        // Key exchange for secure channel
+        const char* peerKeyHex = doc["pubkey"] | "";
+        uint8_t peerKey[32];
+        hexToBytes(peerKeyHex, peerKey, 32);
+        handleKeyExchange(client, peerKey);
+      }
+      else if (strcmp(cmd, "RECOVER") == 0) {
+        handleRecoverCommand(client, doc);
+      }
+      else if (strcmp(cmd, "SHOW_MNEMONIC") == 0) {
+        Serial.println("[CMD] SHOW_MNEMONIC request");
+        client.println("{\"ok\":true}");  // Send response FIRST
+        client.flush();
+        displayMnemonic();  // Then display (takes time)
+      }
+      else if (strcmp(cmd, "SET_WIFI") == 0) {
+        const char* newSsid = doc["ssid"] | "";
+        const char* newPassword = doc["password"] | "";
+        
+        if (strlen(newSsid) == 0) {
+          client.println("{\"ok\":false,\"error\":\"missing_ssid\"}");
+        } else {
+          Preferences wifiPrefs;
+          wifiPrefs.begin("wifi", false);
+          wifiPrefs.putString("ssid", newSsid);
+          wifiPrefs.putString("password", newPassword);
+          wifiPrefs.end();
+          
+          Serial.print("[WiFi] Updated credentials: "); Serial.println(newSsid);
+          client.println("{\"ok\":true,\"message\":\"wifi_updated\"}");
+          drawCentered("WiFi Updated", 0);
+          delay(1000);
+        }
+      }
+      else {
+        Serial.print("[Server] Unknown command: "); Serial.println(cmd);
+        client.println("{\"ok\":false,\"error\":\"unknown_cmd\"}");
+      }
+    }
+    delay(10);
+  }
+  
+  Serial.println("[Server] Client disconnected");
+  secure_channel_ready = false;  // Reset secure channel
+  drawCentered("Waiting for PC...", 0);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n\n=== Secure Hardware Wallet ===");
+  
+  // Initialize buttons
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_OK, INPUT_PULLUP);
+  
+  // Initialize display
+  u8g2.begin();
+  drawCentered("Booting...", 0);
+  delay(500);
+  
+  // Load wallet keys (with mnemonic backup)
+  prefs.begin("wallet", false);
+  bool isFirstBoot = !prefs.isKey("sk");
+  
+  if (!loadOrGenerateKey(prefs, ed25519_sk, ed25519_pk, mnemonicWords)) { 
+    drawCentered("Key error", 0); 
+    while(true) delay(1000); 
+  }
+  prefs.end();
+  
+  Serial.println("[Key] Wallet initialized");
+  
+  // On first boot, show mnemonic for backup
+  if (isFirstBoot) {
+    Serial.println("[Key] NEW WALLET - Displaying backup phrase");
+    displayMnemonic();
+  }
+  
+  // Mode selection using buttons and display
+  drawCentered("Select Mode:", -20);
+  drawCentered("UP=WiFi", 0);
+  drawCentered("DOWN=USB", 20);
+  
+  // Wait for button press
+  bool modeSelected = false;
+  bool useUSB = false;
+  
+  while (!modeSelected) {
+    if (digitalRead(BTN_UP) == LOW) {
+      // WiFi mode selected
+      useUSB = false;
+      modeSelected = true;
+      delay(200); // Debounce
+    }
+    else if (digitalRead(BTN_DOWN) == LOW) {
+      // USB mode selected
+      useUSB = true;
+      modeSelected = true;
+      delay(200); // Debounce
+    }
+    delay(50);
+  }
+  
+  if (useUSB) {
+    // USB mode - wait for PC connection
+    Serial.println("[USB] USB mode selected - waiting for PC...");
+    drawCentered("USB Mode", -10);
+    drawCentered("Connect PC now", 10);
+    delay(1000);
+    sendUSBReady();  // Start USB pairing
+    handleUSBPairing();
+  } else {
+    // WiFi mode
+    Serial.println("[WiFi] WiFi mode selected");
+    drawCentered("WiFi Mode", 0);
+    delay(500);
+    connectWiFi();
+    wifiServer.begin();
+    Serial.print("[Server] Listening on port "); Serial.println(SERVER_PORT);
+    
+    String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
+    drawCentered("WiFi Ready", -10);
+    drawCentered(ipMsg.c_str(), 10);
+  }
+}
+
+void loop() {
+  // Check for USB serial commands
+  handleSerialCommand();
+  
+  // Handle WiFi clients (only if WiFi is connected)
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClient client = wifiServer.available();
+    
+    if (client) {
+      handleClient(client);
+    }
+  }
+  
+  delay(10);
+}
+

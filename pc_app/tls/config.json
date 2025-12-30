@@ -1,5 +1,5 @@
 {
-  "sender_public_key": "A1B2C3D4E5F6G7H8",
+  "sender_public_key": "c27a1f3ae2041bb3a52f6198c6ff147460dab2551b82024036536a769cefe06c",
   "rpc_url": "https://api.devnet.solana.com",
   "recipient_public_key": "",
   "lamports": 1000000,

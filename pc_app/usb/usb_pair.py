@@ -17,10 +17,10 @@ def sha256(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
 
 def derive_aes_key(shared: bytes) -> bytes:
-    salt = b"USBPAIRv1"
-    info = b"AES-256-CTR"
-    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=info)
-    return hkdf.derive(shared)
+    # Must match ESP32: SHA256(shared + "USBPAIRv1"), take first 16 bytes
+    key_material = shared + b"USBPAIRv1"
+    full_hash = hashlib.sha256(key_material).digest()
+    return full_hash[:16]  # 128-bit key for AES-GCM
 
 def open_serial(port: str, baud: int = 115200, timeout: float = 2.0) -> serial.Serial:
     ser = serial.Serial()

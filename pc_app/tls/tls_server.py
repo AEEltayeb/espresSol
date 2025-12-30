@@ -1,8 +1,8 @@
 import socket, ssl, json, os, sys, traceback
-from pc_app.tls.update_config import write_sender_pubkey
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(HERE)
+sys.path.insert(0, HERE)
+from update_config import write_sender_pubkey
 
 HOST, PORT = "0.0.0.0", 8443
 
