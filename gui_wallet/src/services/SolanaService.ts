@@ -4,10 +4,21 @@
  */
 import bs58 from 'bs58';
 
-const RPC_URL = 'https://api.devnet.solana.com';
+// Default to devnet, can be changed via setRpcUrl
+let RPC_URL = 'https://api.devnet.solana.com';
 
 // System Program ID (for transfers)
 const SYSTEM_PROGRAM_ID = '11111111111111111111111111111111';
+
+// Export function to change RPC endpoint
+export function setRpcUrl(url: string) {
+    RPC_URL = url;
+    console.log('[Solana] RPC URL changed to:', url);
+}
+
+export function getRpcUrl(): string {
+    return RPC_URL;
+}
 
 class SolanaService {
     // Get balance in lamports

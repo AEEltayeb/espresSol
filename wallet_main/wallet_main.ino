@@ -112,6 +112,10 @@ const uint32_t MSG_VALIDITY_WINDOW = 60000;  // 60 seconds
 unsigned long last_activity_time = 0;
 const unsigned long SESSION_TIMEOUT = 300000;  // 5 minutes auto-lock
 
+// ===== QR CODE DISPLAY TOGGLE =====
+bool showQRCode = true;  // Toggle between QR code and text IP display
+unsigned long lastDisplayToggle = 0;  // Debounce button
+
 // ===== WEBSOCKET SERVER (for mobile app) =====
 #if USE_WEBSOCKET_SERVER
 WebSocketsServer wsServer(8444);
@@ -1589,12 +1593,10 @@ void setup() {
 #endif
     
     String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
-#if USE_TLS_SERVER
-    drawCentered("TLS+WS Ready", -10);
-#else
-    drawCentered("WiFi Ready", -10);
-#endif
-    drawCentered(ipMsg.c_str(), 10);
+    Serial.print("[WiFi] Pairing QR: "); Serial.println(ipMsg);
+    
+    // Display QR code for mobile app pairing
+    displayIPQRCode(ipMsg);
   }
 }
 
@@ -1604,6 +1606,24 @@ void loop() {
   
   // Handle WiFi clients (only if WiFi is connected)
   if (WiFi.status() == WL_CONNECTED) {
+    // Toggle QR/text display with OK button (when no client connected)
+    if (digitalRead(BTN_OK) == LOW && millis() - lastDisplayToggle > 500) {
+      lastDisplayToggle = millis();
+      showQRCode = !showQRCode;
+      String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
+      if (showQRCode) {
+        displayIPQRCode(ipMsg);
+        Serial.println("[Display] Showing QR code");
+      } else {
+        u8g2.clearBuffer();
+        u8g2.setFont(u8g2_font_9x15_tf);
+        drawCentered("WiFi Ready", -10);
+        drawCentered(ipMsg.c_str(), 10);
+        Serial.println("[Display] Showing text IP");
+      }
+      delay(200);  // Extra debounce
+    }
+    
 #if USE_TLS_SERVER
     WiFiClient rawClient = tlsServer.available();
     if (rawClient) {

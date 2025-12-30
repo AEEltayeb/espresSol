@@ -4,7 +4,7 @@ global.Buffer = Buffer;
 import bs58 from 'bs58';
 
 import { StatusBar } from 'expo-status-bar';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   StyleSheet,
   Text,
@@ -21,15 +21,19 @@ import {
   TouchableWithoutFeedback,
   Modal,
   Alert,
+  Linking,
 } from 'react-native';
 import { LineChart } from 'react-native-chart-kit';
 import * as Clipboard from 'expo-clipboard';
+import { CameraView, Camera } from 'expo-camera';
 import Svg, { Path, Circle, G, Rect } from 'react-native-svg';
 import { useWalletStore } from './src/store/walletStore';
 import { walletService } from './src/services/WalletService';
-import { solanaService } from './src/services/SolanaService';
+import { solanaService, setRpcUrl, getRpcUrl } from './src/services/SolanaService';
+import { useSettingsStore, RPC_ENDPOINTS, CURRENCY_SYMBOLS, convertCurrency } from './src/store/settingsStore';
 
-const COLORS = {
+// Theme colors
+const DARK_COLORS = {
   bg: '#0a0a12',
   card: '#16162a',
   primary: '#8b5cf6',
@@ -41,6 +45,28 @@ const COLORS = {
   border: '#2d2d4a',
   glass: 'rgba(40, 40, 70, 0.85)',
 };
+
+const LIGHT_COLORS = {
+  bg: '#f5f5f7',
+  card: '#ffffff',
+  primary: '#8b5cf6',
+  secondary: '#c4a77d',
+  success: '#22c55e',
+  error: '#ef4444',
+  text: '#1a1a2e',
+  textMuted: '#6b7280',
+  border: '#e5e7eb',
+  glass: 'rgba(255, 255, 255, 0.9)',
+};
+
+// Get current theme based on settings
+const getColors = () => {
+  const darkMode = useSettingsStore.getState().darkMode;
+  return darkMode ? DARK_COLORS : LIGHT_COLORS;
+};
+
+// Default to dark for initial render
+let COLORS = DARK_COLORS;
 
 // ===== SVG ICONS =====
 const EspressoLogo = ({ size = 48 }: { size?: number }) => (
@@ -172,10 +198,20 @@ const KeyIcon = () => (
   </Svg>
 );
 
+const SeedIcon = () => (
+  <Svg width={28} height={28} viewBox="0 0 24 24" fill="none">
+    <Path d="M12 3C12 3 8 6 8 10C8 12 9 14 12 15C15 14 16 12 16 10C16 6 12 3 12 3Z" fill={COLORS.primary + '40'} stroke={COLORS.text} strokeWidth="2" />
+    <Path d="M12 15V21M12 21C10 21 8 19 8 17M12 21C14 21 16 19 16 17" stroke={COLORS.text} strokeWidth="2" strokeLinecap="round" />
+  </Svg>
+);
+
 // ===== CONNECT SCREEN =====
 function ConnectScreen() {
   const { deviceIP, connect, connecting, connectionError, loadSavedIP } = useWalletStore();
   const [ip, setIp] = useState(deviceIP || '');
+  const [showScanner, setShowScanner] = useState(false);
+  const [hasPermission, setHasPermission] = useState<boolean | null>(null);
+  const [scanned, setScanned] = useState(false);
 
   useEffect(() => {
     loadSavedIP().then((savedIp) => {
@@ -183,9 +219,63 @@ function ConnectScreen() {
     });
   }, []);
 
+  const openScanner = async () => {
+    const { status } = await Camera.requestCameraPermissionsAsync();
+    setHasPermission(status === 'granted');
+    if (status === 'granted') {
+      setScanned(false);
+      setShowScanner(true);
+    } else {
+      Alert.alert('Camera Permission', 'Camera access is required to scan QR codes');
+    }
+  };
+
+  const handleBarCodeScanned = ({ data }: { data: string }) => {
+    if (scanned) return;
+    setScanned(true);
+    setShowScanner(false);
+
+    // Parse IP:port from QR code
+    const ipMatch = data.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(:\d+)?$/);
+    if (ipMatch) {
+      setIp(ipMatch[1]);
+      // Auto-connect after short delay
+      setTimeout(() => handleConnect(), 300);
+    } else {
+      Alert.alert('Invalid QR', 'QR code does not contain a valid IP address');
+    }
+  };
+
   const handleConnect = async () => {
     Keyboard.dismiss();
     if (!ip.trim()) return;
+
+    // Check if biometric is enabled and perform authentication
+    const settings = useSettingsStore.getState();
+    if (settings.biometricEnabled) {
+      try {
+        const LocalAuth = await import('expo-local-authentication');
+        const hasHardware = await LocalAuth.hasHardwareAsync();
+        const isEnrolled = await LocalAuth.isEnrolledAsync();
+
+        if (hasHardware && isEnrolled) {
+          const result = await LocalAuth.authenticateAsync({
+            promptMessage: 'Authenticate to connect wallet',
+            cancelLabel: 'Cancel',
+            fallbackLabel: 'Enter Passcode',
+            disableDeviceFallback: false,
+          });
+
+          if (!result.success) {
+            return; // User cancelled or failed authentication
+          }
+        }
+      } catch (e) {
+        console.log('Biometric error:', e);
+        // Continue to connect on error
+      }
+    }
+
     await connect(ip.trim());
   };
 
@@ -211,9 +301,15 @@ function ConnectScreen() {
               returnKeyType="go"
               onSubmitEditing={handleConnect}
             />
+            <TouchableOpacity
+              style={[styles.button, { backgroundColor: '#333', marginTop: 8, paddingVertical: 12 }]}
+              onPress={openScanner}
+            >
+              <Text style={[styles.buttonText, { fontSize: 14 }]}>📷 Scan QR Code</Text>
+            </TouchableOpacity>
           </View>
 
-          <Text style={styles.hint}>Find IP on your ESP32 OLED screen</Text>
+          <Text style={styles.hint}>Scan QR on ESP32 screen or enter IP manually</Text>
 
           {connectionError && (
             <View style={styles.errorBox}>
@@ -228,6 +324,27 @@ function ConnectScreen() {
           >
             {connecting ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Connect</Text>}
           </TouchableOpacity>
+
+          {/* QR Scanner Modal */}
+          <Modal visible={showScanner} animationType="slide">
+            <View style={{ flex: 1, backgroundColor: '#000' }}>
+              <CameraView
+                style={{ flex: 1 }}
+                facing="back"
+                barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
+                onBarcodeScanned={scanned ? undefined : (result) => handleBarCodeScanned({ data: result.data })}
+              />
+              <View style={{ position: 'absolute', top: 50, left: 0, right: 0, alignItems: 'center' }}>
+                <Text style={{ color: '#fff', fontSize: 18, fontWeight: '600' }}>Scan ESP32 QR Code</Text>
+              </View>
+              <TouchableOpacity
+                style={{ position: 'absolute', bottom: 50, alignSelf: 'center', backgroundColor: COLORS.primary, paddingHorizontal: 24, paddingVertical: 12, borderRadius: 20 }}
+                onPress={() => setShowScanner(false)}
+              >
+                <Text style={{ color: '#fff', fontSize: 16, fontWeight: '600' }}>Cancel</Text>
+              </TouchableOpacity>
+            </View>
+          </Modal>
         </ScrollView>
         <StatusBar style="light" />
       </KeyboardAvoidingView>
@@ -342,6 +459,27 @@ function HomeTab({ setMessage }: { setMessage: (m: string) => void }) {
       return;
     }
 
+    // Check if large amount confirmation is needed
+    const settings = useSettingsStore.getState();
+    const solAmount = lamports / 1e9;
+    if (settings.largeAmountConfirmation && solAmount >= settings.largeAmountThreshold) {
+      Alert.alert(
+        'Large Transaction',
+        `You are about to send ${solAmount.toFixed(4)} SOL. This is above your ${settings.largeAmountThreshold} SOL threshold.\n\nContinue?`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Continue', onPress: () => executeSend(lamports) }
+        ]
+      );
+      return;
+    }
+
+    await executeSend(lamports);
+  };
+
+  const executeSend = async (lamports: number) => {
+    if (!publicKey) return;
+
     setSending(true);
     setShowSend(false);
     setMessage('Building transaction...');
@@ -406,74 +544,86 @@ function HomeTab({ setMessage }: { setMessage: (m: string) => void }) {
   };
 
   const solBalance = balance / 1e9;
-  const shortAddress = publicKey ? `${publicKey.slice(0, 6)}...${publicKey.slice(-4)}` : '';
+
+  // Get theme colors
+  const settings = useSettingsStore();
+  const colors = settings.darkMode ? DARK_COLORS : LIGHT_COLORS;
+
+  // Apply showFullAddress setting to address display
+  const displayAddress = publicKey
+    ? (settings.showFullAddress ? publicKey : `${publicKey.slice(0, 6)}...${publicKey.slice(-4)}`)
+    : '';
 
   return (
     <ScrollView
-      style={styles.tabContent}
+      style={[styles.tabContent, { backgroundColor: colors.bg }]}
       contentContainerStyle={styles.scrollContent}
-      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={COLORS.primary} />}
+      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.primary} />}
     >
       {/* Header */}
       <View style={styles.pageHeader}>
         <EspressoLogo size={32} />
-        <Text style={styles.pageTitle}>Home</Text>
+        <Text style={[styles.pageTitle, { color: colors.text }]}>Home</Text>
       </View>
 
       {/* Balance Card */}
-      <View style={styles.balanceCard}>
-        <Text style={styles.balanceLabel}>Total Balance</Text>
-        <Text style={styles.balanceValue}>
-          {solBalance.toFixed(4)} <Text style={styles.balanceCurrency}>SOL</Text>
+      <View style={[styles.balanceCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+        <Text style={[styles.balanceLabel, { color: colors.textMuted }]}>Total Balance</Text>
+        <Text style={[styles.balanceValue, { color: colors.text }]}>
+          {solBalance.toFixed(4)} <Text style={[styles.balanceCurrency, { color: colors.primary }]}>SOL</Text>
         </Text>
-        <Text style={styles.balanceUSD}>${balanceUSD.toFixed(2)} USD</Text>
-        <Text style={styles.priceHint}>1 SOL = ${solPrice.toFixed(2)}</Text>
+        <Text style={[styles.balanceUSD, { color: colors.success }]}>
+          {CURRENCY_SYMBOLS[settings.currency]}{convertCurrency(balanceUSD, settings.currency).toFixed(2)} {settings.currency}
+        </Text>
+        <Text style={[styles.priceHint, { color: colors.textMuted }]}>1 SOL = {CURRENCY_SYMBOLS[settings.currency]}{convertCurrency(solPrice, settings.currency).toFixed(2)}</Text>
       </View>
 
       {/* Address */}
-      <TouchableOpacity style={styles.addressCard} onPress={copyAddress}>
-        <Text style={styles.addressLabel}>Tap to copy</Text>
-        <Text style={styles.addressShort}>{shortAddress}</Text>
+      <TouchableOpacity style={[styles.addressCard, { backgroundColor: colors.card, borderColor: colors.border }]} onPress={copyAddress}>
+        <Text style={[styles.addressLabel, { color: colors.textMuted }]}>Tap to copy</Text>
+        <Text style={[styles.addressShort, { color: colors.text }]} numberOfLines={settings.showFullAddress ? 2 : 1}>{displayAddress}</Text>
       </TouchableOpacity>
 
       {/* Quick Actions */}
-      <View style={styles.actionsRow}>
-        <TouchableOpacity style={styles.actionBtn} onPress={() => setShowSend(true)}>
-          <View style={styles.actionIconWrap}><SendIcon /></View>
-          <Text style={styles.actionLabel}>Send</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.actionBtn} onPress={copyAddress}>
-          <View style={styles.actionIconWrap}><ReceiveIcon /></View>
-          <Text style={styles.actionLabel}>Receive</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={[styles.actionBtn, airdropLoading && styles.buttonDisabled]} onPress={handleAirdrop} disabled={airdropLoading}>
-          <View style={styles.actionIconWrap}><DropIcon /></View>
-          <Text style={styles.actionLabel}>Airdrop</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.actionBtn} onPress={handleShowMnemonic}>
-          <View style={styles.actionIconWrap}><KeyIcon /></View>
-          <Text style={styles.actionLabel}>Backup</Text>
-        </TouchableOpacity>
+      <View style={[styles.actionsCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+        <View style={styles.actionsRow}>
+          <TouchableOpacity style={styles.actionBtn} onPress={() => setShowSend(true)}>
+            <View style={[styles.actionIconWrap, { backgroundColor: colors.primary + '20', borderColor: colors.border }]}><SendIcon /></View>
+            <Text style={[styles.actionLabel, { color: colors.text }]}>Send</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.actionBtn} onPress={copyAddress}>
+            <View style={[styles.actionIconWrap, { backgroundColor: colors.success + '20', borderColor: colors.border }]}><ReceiveIcon /></View>
+            <Text style={[styles.actionLabel, { color: colors.text }]}>Receive</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.actionBtn, airdropLoading && styles.buttonDisabled]} onPress={handleAirdrop} disabled={airdropLoading}>
+            <View style={[styles.actionIconWrap, { backgroundColor: colors.secondary + '20', borderColor: colors.border }]}><DropIcon /></View>
+            <Text style={[styles.actionLabel, { color: colors.text }]}>Airdrop</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.actionBtn} onPress={handleShowMnemonic}>
+            <View style={[styles.actionIconWrap, { backgroundColor: colors.error + '20', borderColor: colors.border }]}><SeedIcon /></View>
+            <Text style={[styles.actionLabel, { color: colors.text }]}>Seed-Phrase</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       {/* Send Modal */}
       <Modal visible={showSend} transparent animationType="fade">
         <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
           <View style={styles.modalOverlay}>
-            <View style={styles.modalContent}>
-              <Text style={styles.modalTitle}>Send SOL</Text>
+            <View style={[styles.modalContent, { backgroundColor: colors.card, borderColor: colors.border }]}>
+              <Text style={[styles.modalTitle, { color: colors.text }]}>Send SOL</Text>
 
               {/* Recent Addresses Pills */}
               {recentAddresses.length > 0 && (
                 <View style={styles.recentRow}>
-                  <Text style={styles.recentLabel}>Recent:</Text>
+                  <Text style={[styles.recentLabel, { color: colors.textMuted }]}>Recent:</Text>
                   {recentAddresses.map((addr) => (
                     <TouchableOpacity
                       key={addr}
-                      style={styles.recentPill}
+                      style={[styles.recentPill, { backgroundColor: colors.border }]}
                       onPress={() => setSendAddress(addr)}
                     >
-                      <Text style={styles.recentPillText}>
+                      <Text style={[styles.recentPillText, { color: colors.text }]}>
                         {addr.slice(0, 4)}...{addr.slice(-4)}
                       </Text>
                     </TouchableOpacity>
@@ -481,14 +631,14 @@ function HomeTab({ setMessage }: { setMessage: (m: string) => void }) {
                 </View>
               )}
 
-              <TextInput style={styles.input} value={sendAddress} onChangeText={setSendAddress} placeholder="Recipient address" placeholderTextColor={COLORS.textMuted} autoCapitalize="none" />
-              <TextInput style={[styles.input, { marginTop: 12 }]} value={sendAmount} onChangeText={setSendAmount} placeholder="Amount (SOL)" placeholderTextColor={COLORS.textMuted} keyboardType="decimal-pad" />
-              <Text style={styles.hint}>Balance: {solBalance.toFixed(4)} SOL</Text>
+              <TextInput style={[styles.input, { backgroundColor: colors.bg, borderColor: colors.border, color: colors.text }]} value={sendAddress} onChangeText={setSendAddress} placeholder="Recipient address" placeholderTextColor={colors.textMuted} autoCapitalize="none" />
+              <TextInput style={[styles.input, { marginTop: 12, backgroundColor: colors.bg, borderColor: colors.border, color: colors.text }]} value={sendAmount} onChangeText={setSendAmount} placeholder="Amount (SOL)" placeholderTextColor={colors.textMuted} keyboardType="decimal-pad" />
+              <Text style={[styles.hint, { color: colors.textMuted }]}>Balance: {solBalance.toFixed(4)} SOL</Text>
               <TouchableOpacity style={[styles.button, { marginTop: 16 }]} onPress={handleSend} disabled={sending}>
                 {sending ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Send</Text>}
               </TouchableOpacity>
-              <TouchableOpacity style={[styles.button, styles.cancelButton, { marginTop: 8 }]} onPress={() => setShowSend(false)}>
-                <Text style={styles.buttonText}>Cancel</Text>
+              <TouchableOpacity style={[styles.button, styles.cancelButton, { marginTop: 8, backgroundColor: colors.border }]} onPress={() => setShowSend(false)}>
+                <Text style={[styles.buttonText, { color: colors.text }]}>Cancel</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -500,6 +650,8 @@ function HomeTab({ setMessage }: { setMessage: (m: string) => void }) {
 
 function AnalyticsTab() {
   const { balance, balanceHistory, solPrice, balanceUSD, publicKey } = useWalletStore();
+  const settings = useSettingsStore();
+  const colors = settings.darkMode ? DARK_COLORS : LIGHT_COLORS;
   const solBalance = balance / 1e9;
   const [transactions, setTransactions] = useState<Array<{
     signature: string;
@@ -509,6 +661,13 @@ function AnalyticsTab() {
     blockTime: number | null;
   }>>([]);
   const [loadingTx, setLoadingTx] = useState(false);
+  const [selectedTx, setSelectedTx] = useState<{
+    signature: string;
+    type: 'send' | 'receive' | 'unknown';
+    amount: number;
+    otherParty: string;
+    blockTime: number | null;
+  } | null>(null);
 
   // Fetch real transactions from Solana
   useEffect(() => {
@@ -557,33 +716,33 @@ function AnalyticsTab() {
   };
 
   return (
-    <ScrollView style={styles.tabContent} contentContainerStyle={styles.scrollContent}>
+    <ScrollView style={[styles.tabContent, { backgroundColor: colors.bg }]} contentContainerStyle={styles.scrollContent}>
       {/* Header */}
       <View style={styles.pageHeader}>
         <ChartIcon active={true} />
-        <Text style={styles.pageTitle}>Analytics</Text>
+        <Text style={[styles.pageTitle, { color: colors.text }]}>Analytics</Text>
       </View>
 
       <View style={styles.statsGrid}>
-        <View style={styles.statCard}>
-          <Text style={styles.statValue}>{solBalance.toFixed(4)}</Text>
-          <Text style={styles.statLabel}>SOL Balance</Text>
+        <View style={[styles.statCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+          <Text style={[styles.statValue, { color: colors.text }]}>{solBalance.toFixed(4)}</Text>
+          <Text style={[styles.statLabel, { color: colors.textMuted }]}>SOL Balance</Text>
         </View>
-        <View style={styles.statCard}>
-          <Text style={styles.statValue}>${balanceUSD.toFixed(2)}</Text>
-          <Text style={styles.statLabel}>USD Value</Text>
+        <View style={[styles.statCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+          <Text style={[styles.statValue, { color: colors.text }]}>${balanceUSD.toFixed(2)}</Text>
+          <Text style={[styles.statLabel, { color: colors.textMuted }]}>USD Value</Text>
         </View>
-        <View style={styles.statCard}>
-          <Text style={styles.statValue}>${solPrice.toFixed(2)}</Text>
-          <Text style={styles.statLabel}>SOL Price</Text>
+        <View style={[styles.statCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+          <Text style={[styles.statValue, { color: colors.text }]}>${solPrice.toFixed(2)}</Text>
+          <Text style={[styles.statLabel, { color: colors.textMuted }]}>SOL Price</Text>
         </View>
-        <View style={styles.statCard}>
-          <Text style={styles.statValue}>{transactions.length}</Text>
-          <Text style={styles.statLabel}>Transactions</Text>
+        <View style={[styles.statCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
+          <Text style={[styles.statValue, { color: colors.text }]}>{transactions.length}</Text>
+          <Text style={[styles.statLabel, { color: colors.textMuted }]}>Transactions</Text>
         </View>
       </View>
 
-      <Text style={styles.chartTitle}>Balance History (SOL)</Text>
+      <Text style={[styles.chartTitle, { color: colors.textMuted }]}>Balance History (SOL)</Text>
       <LineChart
         data={chartData}
         width={Dimensions.get('window').width - 40}
@@ -591,66 +750,157 @@ function AnalyticsTab() {
         yAxisSuffix=""
         yAxisLabel=""
         chartConfig={{
-          backgroundColor: COLORS.card,
-          backgroundGradientFrom: COLORS.card,
-          backgroundGradientTo: COLORS.bg,
+          backgroundColor: colors.card,
+          backgroundGradientFrom: colors.card,
+          backgroundGradientTo: colors.bg,
           decimalPlaces: 2,
           color: (opacity = 1) => `rgba(139, 92, 246, ${opacity})`,
-          labelColor: () => COLORS.textMuted,
-          propsForDots: { r: '5', strokeWidth: '2', stroke: COLORS.primary },
-          propsForBackgroundLines: { strokeDasharray: '', stroke: COLORS.border },
-          fillShadowGradientFrom: COLORS.primary,
+          labelColor: () => colors.textMuted,
+          propsForDots: { r: '5', strokeWidth: '2', stroke: colors.primary },
+          propsForBackgroundLines: { strokeDasharray: '', stroke: colors.border },
+          fillShadowGradientFrom: colors.primary,
           fillShadowGradientTo: 'transparent',
           fillShadowGradientOpacity: 0.3,
         }}
         bezier
-        style={styles.chart}
+        style={{ ...styles.chart, backgroundColor: colors.card, borderRadius: 16 }}
         fromZero={true}
       />
 
       {/* Transactions Section */}
-      <Text style={[styles.chartTitle, { marginTop: 24 }]}>Recent Transactions</Text>
+      <Text style={[styles.chartTitle, { marginTop: 24, color: colors.textMuted }]}>Recent Transactions</Text>
       {loadingTx ? (
         <View style={styles.emptyState}>
-          <ActivityIndicator color={COLORS.primary} />
+          <ActivityIndicator color={colors.primary} />
         </View>
       ) : transactions.length === 0 ? (
-        <View style={styles.emptyState}>
-          <Text style={styles.emptyStateText}>No transactions yet</Text>
+        <View style={[styles.emptyState, { backgroundColor: colors.card, borderColor: colors.border }]}>
+          <Text style={[styles.emptyStateText, { color: colors.textMuted }]}>No transactions yet</Text>
         </View>
       ) : (
         transactions.map((tx) => (
-          <View key={tx.signature} style={styles.txItem}>
+          <TouchableOpacity key={tx.signature} style={[styles.txItem, { backgroundColor: colors.card, borderColor: colors.border }]} onPress={() => setSelectedTx(tx)}>
             <View style={[styles.txIcon, tx.type === 'receive' ? styles.txIconReceive : styles.txIconSend]}>
               <Text style={styles.txIconText}>{tx.type === 'receive' ? '↓' : '↑'}</Text>
             </View>
             <View style={styles.txDetails}>
-              <Text style={styles.txTitle}>
+              <Text style={[styles.txTitle, { color: colors.text }]}>
                 {tx.type === 'receive'
                   ? `From ${tx.otherParty.slice(0, 6)}...`
                   : `To ${tx.otherParty.slice(0, 6)}...`}
               </Text>
-              <Text style={styles.txDate}>{timeAgo(tx.blockTime)}</Text>
+              <Text style={[styles.txDate, { color: colors.textMuted }]}>{timeAgo(tx.blockTime)}</Text>
             </View>
             <Text style={[styles.txAmount, tx.type === 'receive' ? styles.txAmountReceive : styles.txAmountSend]}>
               {tx.type === 'receive' ? '+' : '-'}{(tx.amount / 1e9).toFixed(4)} SOL
             </Text>
-          </View>
+          </TouchableOpacity>
         ))
       )}
+
+      {/* Transaction Details Modal */}
+      <Modal visible={!!selectedTx} transparent animationType="fade">
+        <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'center', padding: 20 }}>
+          <View style={{ backgroundColor: colors.card, borderRadius: 20, padding: 20, borderWidth: 1, borderColor: colors.border }}>
+            <Text style={{ fontSize: 20, fontWeight: '700', color: colors.text, marginBottom: 16, textAlign: 'center' }}>
+              Transaction Details
+            </Text>
+
+            {selectedTx && (
+              <>
+                <View style={{ marginBottom: 12 }}>
+                  <Text style={{ color: colors.textMuted, fontSize: 12, marginBottom: 4 }}>Type</Text>
+                  <Text style={{ color: selectedTx.type === 'receive' ? '#22c55e' : '#ef4444', fontSize: 16, fontWeight: '600' }}>
+                    {selectedTx.type === 'receive' ? '↓ Received' : '↑ Sent'}
+                  </Text>
+                </View>
+
+                <View style={{ marginBottom: 12 }}>
+                  <Text style={{ color: colors.textMuted, fontSize: 12, marginBottom: 4 }}>Amount</Text>
+                  <Text style={{ color: colors.text, fontSize: 18, fontWeight: '700' }}>
+                    {selectedTx.type === 'receive' ? '+' : '-'}{(selectedTx.amount / 1e9).toFixed(6)} SOL
+                  </Text>
+                </View>
+
+                <View style={{ marginBottom: 12 }}>
+                  <Text style={{ color: colors.textMuted, fontSize: 12, marginBottom: 4 }}>
+                    {selectedTx.type === 'receive' ? 'From' : 'To'}
+                  </Text>
+                  <TouchableOpacity onPress={() => { Clipboard.setStringAsync(selectedTx.otherParty); Alert.alert('Copied', 'Address copied to clipboard'); }}>
+                    <Text style={{ color: colors.primary, fontSize: 14 }} numberOfLines={2}>{selectedTx.otherParty}</Text>
+                    <Text style={{ color: colors.textMuted, fontSize: 12 }}>Tap to copy</Text>
+                  </TouchableOpacity>
+                </View>
+
+                <View style={{ marginBottom: 12 }}>
+                  <Text style={{ color: colors.textMuted, fontSize: 12, marginBottom: 4 }}>Date</Text>
+                  <Text style={{ color: colors.text, fontSize: 14 }}>
+                    {selectedTx.blockTime ? new Date(selectedTx.blockTime * 1000).toLocaleString() : 'Unknown'}
+                  </Text>
+                </View>
+
+                <View style={{ marginBottom: 16 }}>
+                  <Text style={{ color: colors.textMuted, fontSize: 12, marginBottom: 4 }}>Signature</Text>
+                  <TouchableOpacity onPress={() => { Clipboard.setStringAsync(selectedTx.signature); Alert.alert('Copied', 'Signature copied to clipboard'); }}>
+                    <Text style={{ color: colors.primary, fontSize: 12 }} numberOfLines={2}>{selectedTx.signature}</Text>
+                    <Text style={{ color: colors.textMuted, fontSize: 12 }}>Tap to copy</Text>
+                  </TouchableOpacity>
+                </View>
+              </>
+            )}
+
+            <TouchableOpacity
+              style={{ backgroundColor: colors.primary, paddingVertical: 12, borderRadius: 12 }}
+              onPress={() => setSelectedTx(null)}
+            >
+              <Text style={{ color: '#fff', fontSize: 16, fontWeight: '600', textAlign: 'center' }}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </ScrollView>
   );
 }
 
-// ===== PROFILE TAB =====
-function ProfileTab({ setMessage }: { setMessage: (m: string) => void }) {
-  const { publicKey, disconnect } = useWalletStore();
+// ===== SETTINGS TAB =====
+function SettingsTab({ setMessage }: { setMessage: (m: string) => void }) {
+  const { publicKey, disconnect, deviceIP } = useWalletStore();
+  const settings = useSettingsStore();
+
   const [showRecover, setShowRecover] = useState(false);
+  const [showWifi, setShowWifi] = useState(false);
+  const [showReset, setShowReset] = useState(false);
+  const [showLicenses, setShowLicenses] = useState(false);
   const [words, setWords] = useState<string[]>(Array(12).fill(''));
   const [recovering, setRecovering] = useState(false);
+  const [wifiSSID, setWifiSSID] = useState('');
+  const [wifiPassword, setWifiPassword] = useState('');
+  const [sendingWifi, setSendingWifi] = useState(false);
 
+  // Biometric check - simplified to avoid Metro bundling issues
+  const checkBiometrics = async () => {
+    try {
+      // Just toggle the setting - actual biometric check would happen on app startup
+      settings.setBiometricEnabled(!settings.biometricEnabled);
+      if (!settings.biometricEnabled) {
+        setMessage('Biometric unlock enabled! You\'ll be asked to authenticate on next launch.');
+      } else {
+        setMessage('Biometric unlock disabled');
+      }
+    } catch (e) {
+      setMessage('Biometric settings updated');
+    }
+  };
+
+  // Network change
+  const handleNetworkChange = (network: 'devnet' | 'mainnet' | 'testnet') => {
+    settings.setNetwork(network);
+    setRpcUrl(RPC_ENDPOINTS[network]);
+    setMessage(`Switched to ${network.toUpperCase()}`);
+  };
+
+  // Recovery
   const handleRecovery = async () => {
-    // Validate all words are entered
     const cleanWords = words.map(w => w.trim().toLowerCase());
     if (cleanWords.some(w => !w)) {
       setMessage('Please enter all 12 words');
@@ -666,10 +916,7 @@ function ProfileTab({ setMessage }: { setMessage: (m: string) => void }) {
       if (success) {
         setMessage('Recovery successful! Device restarting...');
         setWords(Array(12).fill(''));
-        // Disconnect since device will restart
-        setTimeout(() => {
-          disconnect();
-        }, 3000);
+        setTimeout(() => disconnect(), 3000);
       } else {
         setMessage('Recovery failed - check words');
       }
@@ -679,56 +926,272 @@ function ProfileTab({ setMessage }: { setMessage: (m: string) => void }) {
     setRecovering(false);
   };
 
+  // WiFi config
+  const handleWifiConfig = async () => {
+    if (!wifiSSID) {
+      setMessage('Please enter WiFi SSID');
+      return;
+    }
+    setSendingWifi(true);
+    try {
+      const success = await walletService.setWifi(wifiSSID, wifiPassword);
+      if (success) {
+        setMessage('WiFi configured! Device restarting...');
+        setShowWifi(false);
+        setTimeout(() => disconnect(), 3000);
+      } else {
+        setMessage('Failed to set WiFi');
+      }
+    } catch (e: any) {
+      setMessage('Error: ' + e.message);
+    }
+    setSendingWifi(false);
+  };
+
+  // Factory reset
+  const handleFactoryReset = async () => {
+    setMessage('Factory reset initiated on device...');
+    setShowReset(false);
+    try {
+      // TODO: Add FACTORY_RESET command to ESP32
+      setMessage('Factory reset not yet implemented on device');
+    } catch (e: any) {
+      setMessage('Error: ' + e.message);
+    }
+  };
+
   const updateWord = (index: number, value: string) => {
     const newWords = [...words];
     newWords[index] = value.toLowerCase().trim();
     setWords(newWords);
   };
 
+  // Theme colors
+  const colors = settings.darkMode ? DARK_COLORS : LIGHT_COLORS;
+
   return (
-    <ScrollView style={styles.tabContent} contentContainerStyle={styles.scrollContent}>
+    <ScrollView style={[styles.tabContent, { backgroundColor: colors.bg }]} contentContainerStyle={styles.scrollContent}>
       {/* Header */}
       <View style={styles.pageHeader}>
         <UserIcon active={true} />
-        <Text style={styles.pageTitle}>Profile</Text>
+        <Text style={[styles.pageTitle, { color: colors.text }]}>Settings</Text>
       </View>
 
-      <View style={styles.profileHeader}>
-        <EspressoLogo size={56} />
-        <Text style={styles.profileName}>espresSol</Text>
+      {/* Wallet Info */}
+      <View style={[styles.settingsSection, { backgroundColor: colors.card, borderColor: colors.border }]}>
+        <View style={styles.profileHeader}>
+          <EspressoLogo size={48} />
+          <Text style={[styles.profileName, { color: colors.text }]}>espresSol</Text>
+        </View>
+        <View style={[styles.profileCard, { backgroundColor: colors.bg, borderColor: colors.border }]}>
+          <Text style={[styles.profileLabel, { color: colors.textMuted }]}>Wallet Address</Text>
+          <Text style={[styles.profileValue, { color: colors.text }]} numberOfLines={1}>
+            {settings.showFullAddress ? publicKey : `${publicKey?.slice(0, 10)}...${publicKey?.slice(-8)}`}
+          </Text>
+        </View>
       </View>
 
-      <View style={styles.profileCard}>
-        <Text style={styles.profileLabel}>Wallet Address</Text>
-        <Text style={styles.profileValue}>{publicKey}</Text>
+      {/* Network & Connection */}
+      <Text style={[styles.sectionTitle, { color: colors.textMuted }]}>Network & Connection</Text>
+      <View style={[styles.settingsSection, { backgroundColor: colors.card, borderColor: colors.border }]}>
+        <View style={styles.settingRow}>
+          <Text style={[styles.settingLabel, { color: colors.text }]}>Network</Text>
+          <View style={styles.networkPills}>
+            <View style={[styles.networkPill, styles.networkPillActive]}>
+              <Text style={[styles.networkPillText, styles.networkPillTextActive]}>Devnet</Text>
+            </View>
+            <TouchableOpacity
+              style={[styles.networkPill, styles.networkPillDisabled]}
+              onPress={() => setMessage('Mainnet coming soon!')}
+            >
+              <Text style={[styles.networkPillText, styles.networkPillTextDisabled]}>Mainnet</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.networkPill, styles.networkPillDisabled]}
+              onPress={() => setMessage('Testnet coming soon!')}
+            >
+              <Text style={[styles.networkPillText, styles.networkPillTextDisabled]}>Testnet</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        <View style={[styles.settingRow, { borderBottomColor: colors.border + '50' }]}>
+          <Text style={[styles.settingLabel, { color: colors.text }]}>Device IP</Text>
+          <Text style={[styles.settingValue, { color: colors.textMuted }]}>{deviceIP || 'Not connected'}</Text>
+        </View>
+
+        <View style={[styles.settingRow, { borderBottomColor: colors.border + '50' }]}>
+          <Text style={[styles.settingLabel, { color: colors.text }]}>Timeout: {settings.connectionTimeout}s</Text>
+          <View style={styles.sliderRow}>
+            <TouchableOpacity style={[styles.sliderBtn, { backgroundColor: colors.border }]} onPress={() => settings.setConnectionTimeout(Math.max(10, settings.connectionTimeout - 10))}>
+              <Text style={[styles.sliderBtnText, { color: colors.text }]}>−</Text>
+            </TouchableOpacity>
+            <View style={[styles.sliderTrack, { backgroundColor: colors.border }]}>
+              <View style={[styles.sliderFill, { width: `${((settings.connectionTimeout - 10) / 50) * 100}%` }]} />
+            </View>
+            <TouchableOpacity style={[styles.sliderBtn, { backgroundColor: colors.border }]} onPress={() => settings.setConnectionTimeout(Math.min(60, settings.connectionTimeout + 10))}>
+              <Text style={[styles.sliderBtnText, { color: colors.text }]}>+</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
       </View>
 
-      <TouchableOpacity style={styles.menuItem} onPress={async () => {
-        setMessage('Check your device!');
-        await walletService.showMnemonic();
-      }}>
-        <KeyIcon />
-        <Text style={styles.menuText}>Backup Phrase</Text>
-      </TouchableOpacity>
+      {/* Security */}
+      <Text style={[styles.sectionTitle, { color: colors.textMuted }]}>Security</Text>
+      <View style={[styles.settingsSection, { backgroundColor: colors.card, borderColor: colors.border }]}>
+        <TouchableOpacity style={[styles.settingRow, { borderBottomColor: colors.border + '50' }]} onPress={checkBiometrics}>
+          <Text style={[styles.settingLabel, { color: colors.text }]}>Biometric Unlock</Text>
+          <View style={[styles.toggle, settings.biometricEnabled && styles.toggleActive]}>
+            <View style={[styles.toggleDot, settings.biometricEnabled && styles.toggleDotActive]} />
+          </View>
+        </TouchableOpacity>
 
-      <TouchableOpacity style={styles.menuItem} onPress={() => setShowRecover(true)}>
-        <Text style={styles.menuIconText}>🔄</Text>
-        <Text style={styles.menuText}>Recover Wallet</Text>
-      </TouchableOpacity>
+        <View style={[styles.settingRow, { borderBottomColor: colors.border + '50' }]}>
+          <Text style={[styles.settingLabel, { color: colors.text }]}>Session Timeout: {settings.sessionTimeout}min</Text>
+          <View style={styles.sliderRow}>
+            <TouchableOpacity style={[styles.sliderBtn, { backgroundColor: colors.border }]} onPress={() => settings.setSessionTimeout(Math.max(1, settings.sessionTimeout - 1))}>
+              <Text style={[styles.sliderBtnText, { color: colors.text }]}>−</Text>
+            </TouchableOpacity>
+            <View style={[styles.sliderTrack, { backgroundColor: colors.border }]}>
+              <View style={[styles.sliderFill, { width: `${(settings.sessionTimeout / 30) * 100}%` }]} />
+            </View>
+            <TouchableOpacity style={[styles.sliderBtn, { backgroundColor: colors.border }]} onPress={() => settings.setSessionTimeout(Math.min(30, settings.sessionTimeout + 1))}>
+              <Text style={[styles.sliderBtnText, { color: colors.text }]}>+</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
 
-      <TouchableOpacity style={styles.menuItem} onPress={() => setMessage('Network: Devnet')}>
-        <Text style={styles.menuIconText}>🌐</Text>
-        <Text style={styles.menuText}>Network</Text>
-      </TouchableOpacity>
+        <TouchableOpacity style={[styles.settingRow, { borderBottomColor: colors.border + '50' }]} onPress={() => settings.setLargeAmountConfirmation(!settings.largeAmountConfirmation)}>
+          <Text style={[styles.settingLabel, { color: colors.text }]}>Confirm large amounts</Text>
+          <View style={[styles.toggle, settings.largeAmountConfirmation && styles.toggleActive]}>
+            <View style={[styles.toggleDot, settings.largeAmountConfirmation && styles.toggleDotActive]} />
+          </View>
+        </TouchableOpacity>
 
-      <TouchableOpacity style={styles.menuItem} onPress={() => setMessage('Settings coming soon!')}>
-        <Text style={styles.menuIconText}>⚙️</Text>
-        <Text style={styles.menuText}>Settings</Text>
-      </TouchableOpacity>
+        {settings.largeAmountConfirmation && (
+          <View style={[styles.settingRow, { borderBottomColor: colors.border + '50' }]}>
+            <Text style={[styles.settingLabel, { color: colors.text }]}>Threshold: {settings.largeAmountThreshold} SOL</Text>
+            <View style={styles.sliderRow}>
+              <TouchableOpacity style={[styles.sliderBtn, { backgroundColor: colors.border }]} onPress={() => settings.setLargeAmountThreshold(Math.max(0.1, settings.largeAmountThreshold - 0.5))}>
+                <Text style={[styles.sliderBtnText, { color: colors.text }]}>−</Text>
+              </TouchableOpacity>
+              <View style={[styles.sliderTrack, { backgroundColor: colors.border }]}>
+                <View style={[styles.sliderFill, { width: `${(settings.largeAmountThreshold / 10) * 100}%` }]} />
+              </View>
+              <TouchableOpacity style={[styles.sliderBtn, { backgroundColor: colors.border }]} onPress={() => settings.setLargeAmountThreshold(Math.min(10, settings.largeAmountThreshold + 0.5))}>
+                <Text style={[styles.sliderBtnText, { color: colors.text }]}>+</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+      </View>
 
-      <TouchableOpacity style={[styles.menuItem, styles.dangerItem]} onPress={disconnect}>
-        <Text style={styles.menuIconText}>🚪</Text>
-        <Text style={[styles.menuText, { color: COLORS.error }]}>Disconnect</Text>
+      {/* Display */}
+      <Text style={[styles.sectionTitle, { color: colors.textMuted }]}>Display</Text>
+      <View style={[styles.settingsSection, { backgroundColor: colors.card, borderColor: colors.border }]}>
+        <View style={[styles.settingRow, { borderBottomColor: colors.border + '50' }]}>
+          <Text style={[styles.settingLabel, { color: colors.text }]}>Currency</Text>
+          <View style={styles.networkPills}>
+            {(['USD', 'EUR', 'GBP'] as const).map((cur) => (
+              <TouchableOpacity
+                key={cur}
+                style={[styles.networkPill, settings.currency === cur && styles.networkPillActive]}
+                onPress={() => settings.setCurrency(cur)}
+              >
+                <Text style={[styles.networkPillText, settings.currency === cur && styles.networkPillTextActive]}>
+                  {CURRENCY_SYMBOLS[cur]} {cur}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </View>
+
+        <TouchableOpacity style={[styles.settingRow, { borderBottomColor: colors.border + '50' }]} onPress={() => settings.setShowFullAddress(!settings.showFullAddress)}>
+          <Text style={[styles.settingLabel, { color: colors.text }]}>Show full address</Text>
+          <View style={[styles.toggle, settings.showFullAddress && styles.toggleActive]}>
+            <View style={[styles.toggleDot, settings.showFullAddress && styles.toggleDotActive]} />
+          </View>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={[styles.settingRow, { borderBottomColor: colors.border + '50' }]} onPress={() => settings.setDarkMode(!settings.darkMode)}>
+          <Text style={[styles.settingLabel, { color: colors.text }]}>Dark Mode</Text>
+          <View style={[styles.toggle, settings.darkMode && styles.toggleActive]}>
+            <View style={[styles.toggleDot, settings.darkMode && styles.toggleDotActive]} />
+          </View>
+        </TouchableOpacity>
+      </View>
+
+      {/* Device Management */}
+      <Text style={[styles.sectionTitle, { color: colors.textMuted }]}>Device Management</Text>
+      <View style={[styles.settingsSection, { backgroundColor: colors.card, borderColor: colors.border }]}>
+        <TouchableOpacity style={[styles.menuItem, { backgroundColor: colors.card, borderColor: colors.border }]} onPress={() => setShowWifi(true)}>
+          <Svg width={20} height={20} viewBox="0 0 24 24" fill="none" style={{ marginRight: 14 }}>
+            <Path d="M5 12.5C8.5 8 15.5 8 19 12.5" stroke={colors.text} strokeWidth="2" strokeLinecap="round" />
+            <Path d="M8 15.5C10 13 14 13 16 15.5" stroke={colors.text} strokeWidth="2" strokeLinecap="round" />
+            <Circle cx="12" cy="19" r="1" fill={colors.text} />
+          </Svg>
+          <Text style={[styles.menuText, { color: colors.text }]}>Configure WiFi</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={[styles.menuItem, { backgroundColor: colors.card, borderColor: colors.border }]} onPress={async () => {
+          setMessage('Check your device!');
+          await walletService.showMnemonic();
+        }}>
+          <Svg width={20} height={20} viewBox="0 0 24 24" fill="none" style={{ marginRight: 14 }}>
+            <Path d="M12 3C12 3 8 6 8 10C8 12 9 14 12 15C15 14 16 12 16 10C16 6 12 3 12 3Z" fill={colors.primary + '20'} stroke={colors.text} strokeWidth="2" />
+            <Path d="M12 15V21M12 21C10 21 8 19 8 17M12 21C14 21 16 19 16 17" stroke={colors.text} strokeWidth="2" strokeLinecap="round" />
+          </Svg>
+          <Text style={[styles.menuText, { color: colors.text }]}>View Seed Phrase</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={[styles.menuItem, { backgroundColor: colors.card, borderColor: colors.border }]} onPress={() => setShowRecover(true)}>
+          <Svg width={20} height={20} viewBox="0 0 24 24" fill="none" style={{ marginRight: 14 }}>
+            <Path d="M4 12C4 7.58 7.58 4 12 4C14.5 4 16.74 5.12 18.24 6.88" stroke={colors.text} strokeWidth="2" strokeLinecap="round" />
+            <Path d="M20 12C20 16.42 16.42 20 12 20C9.5 20 7.26 18.88 5.76 17.12" stroke={colors.text} strokeWidth="2" strokeLinecap="round" />
+            <Path d="M18 3V7H22" stroke={colors.text} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+            <Path d="M6 21V17H2" stroke={colors.text} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+          </Svg>
+          <Text style={[styles.menuText, { color: colors.text }]}>Recover Wallet</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={[styles.menuItem, styles.dangerItem, { backgroundColor: colors.card }]} onPress={() => setShowReset(true)}>
+          <Svg width={20} height={20} viewBox="0 0 24 24" fill="none" style={{ marginRight: 14 }}>
+            <Path d="M12 9V13M12 17H12.01" stroke={colors.error} strokeWidth="2" strokeLinecap="round" />
+            <Path d="M5 19H19L12 5L5 19Z" stroke={colors.error} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+          </Svg>
+          <Text style={[styles.menuText, { color: colors.error }]}>Factory Reset</Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* About */}
+      <Text style={[styles.sectionTitle, { color: colors.textMuted }]}>About</Text>
+      <View style={[styles.settingsSection, { backgroundColor: colors.card, borderColor: colors.border }]}>
+        <View style={[styles.settingRow, { borderBottomColor: colors.border + '50' }]}>
+          <Text style={[styles.settingLabel, { color: colors.text }]}>App Version</Text>
+          <Text style={[styles.settingValue, { color: colors.textMuted }]}>1.0.0</Text>
+        </View>
+        <View style={[styles.settingRow, { borderBottomColor: colors.border + '50' }]}>
+          <Text style={[styles.settingLabel, { color: colors.text }]}>Firmware Version</Text>
+          <Text style={[styles.settingValue, { color: colors.textMuted }]}>ESP32 v2.0</Text>
+        </View>
+        <View style={[styles.settingRow, { borderBottomColor: colors.border + '50', flexDirection: 'column', alignItems: 'flex-start' }]}>
+          <Text style={[styles.settingLabel, { color: colors.text, marginBottom: 8 }]}>Developed by</Text>
+          <TouchableOpacity onPress={() => Linking.openURL('https://github.com/nimamehranfar')} style={{ marginBottom: 4 }}>
+            <Text style={{ color: colors.primary, fontSize: 14 }}>@nimamehranfar</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => Linking.openURL('https://github.com/AEEltayeb')}>
+            <Text style={{ color: colors.primary, fontSize: 14 }}>@AEEltayeb</Text>
+          </TouchableOpacity>
+        </View>
+        <TouchableOpacity style={[styles.settingRow, { borderBottomWidth: 0 }]} onPress={() => setShowLicenses(true)}>
+          <Text style={[styles.settingLabel, { color: colors.text }]}>Open Source Licenses</Text>
+          <Text style={{ color: colors.textMuted, fontSize: 18 }}>›</Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* Disconnect */}
+      <TouchableOpacity style={[styles.button, styles.cancelButton, { marginTop: 16, backgroundColor: colors.border }]} onPress={disconnect}>
+        <Text style={[styles.buttonText, { color: colors.text }]}>Disconnect Wallet</Text>
       </TouchableOpacity>
 
       {/* Recovery Modal */}
@@ -738,7 +1201,7 @@ function ProfileTab({ setMessage }: { setMessage: (m: string) => void }) {
             <View style={[styles.modalContent, { maxHeight: '90%' }]}>
               <Text style={styles.modalTitle}>Recover Wallet</Text>
               <Text style={[styles.hint, { marginBottom: 16 }]}>
-                Enter your 12-word backup phrase to restore wallet on the hardware device.
+                Enter your 12-word backup phrase to restore wallet.
               </Text>
 
               <ScrollView style={{ maxHeight: 300 }}>
@@ -758,27 +1221,97 @@ function ProfileTab({ setMessage }: { setMessage: (m: string) => void }) {
                 ))}
               </ScrollView>
 
-              <TouchableOpacity
-                style={[styles.button, { marginTop: 16 }]}
-                onPress={handleRecovery}
-                disabled={recovering}
-              >
-                {recovering ? (
-                  <ActivityIndicator color="#fff" />
-                ) : (
-                  <Text style={styles.buttonText}>Recover</Text>
-                )}
+              <TouchableOpacity style={[styles.button, { marginTop: 16 }]} onPress={handleRecovery} disabled={recovering}>
+                {recovering ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Recover</Text>}
               </TouchableOpacity>
-
-              <TouchableOpacity
-                style={[styles.button, styles.cancelButton, { marginTop: 8 }]}
-                onPress={() => setShowRecover(false)}
-              >
+              <TouchableOpacity style={[styles.button, styles.cancelButton, { marginTop: 8 }]} onPress={() => setShowRecover(false)}>
                 <Text style={styles.buttonText}>Cancel</Text>
               </TouchableOpacity>
             </View>
           </View>
         </TouchableWithoutFeedback>
+      </Modal>
+
+      {/* WiFi Modal */}
+      <Modal visible={showWifi} transparent animationType="fade">
+        <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <Text style={styles.modalTitle}>Configure WiFi</Text>
+              <TextInput
+                style={styles.input}
+                value={wifiSSID}
+                onChangeText={setWifiSSID}
+                placeholder="WiFi Network Name (SSID)"
+                placeholderTextColor={COLORS.textMuted}
+              />
+              <TextInput
+                style={[styles.input, { marginTop: 12 }]}
+                value={wifiPassword}
+                onChangeText={setWifiPassword}
+                placeholder="Password"
+                placeholderTextColor={COLORS.textMuted}
+                secureTextEntry
+              />
+              <TouchableOpacity style={[styles.button, { marginTop: 16 }]} onPress={handleWifiConfig} disabled={sendingWifi}>
+                {sendingWifi ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Save to Device</Text>}
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.button, styles.cancelButton, { marginTop: 8 }]} onPress={() => setShowWifi(false)}>
+                <Text style={styles.buttonText}>Cancel</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </TouchableWithoutFeedback>
+      </Modal>
+
+      {/* Factory Reset Modal */}
+      <Modal visible={showReset} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>⚠️ Factory Reset</Text>
+            <Text style={[styles.hint, { color: COLORS.error, textAlign: 'center' }]}>
+              This will ERASE all data on the device including your private keys!
+            </Text>
+            <Text style={[styles.hint, { marginTop: 16, textAlign: 'center' }]}>
+              Make sure you have backed up your recovery phrase before proceeding.
+            </Text>
+            <TouchableOpacity style={[styles.button, { marginTop: 24, backgroundColor: COLORS.error }]} onPress={handleFactoryReset}>
+              <Text style={styles.buttonText}>Yes, Erase Everything</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.button, styles.cancelButton, { marginTop: 8 }]} onPress={() => setShowReset(false)}>
+              <Text style={styles.buttonText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Licenses Modal */}
+      <Modal visible={showLicenses} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { maxHeight: '80%' }]}>
+            <Text style={styles.modalTitle}>Open Source Licenses</Text>
+            <ScrollView style={{ maxHeight: 400 }}>
+              <Text style={styles.licenseText}>
+                This app uses the following open source libraries:{'\n\n'}
+                • React Native (MIT){'\n'}
+                • Expo (MIT){'\n'}
+                • Zustand (MIT){'\n'}
+                • react-native-chart-kit (MIT){'\n'}
+                • bs58 (MIT){'\n'}
+                • expo-local-authentication (MIT){'\n'}
+                • expo-secure-store (MIT){'\n'}
+                • AsyncStorage (MIT){'\n\n'}
+                Hardware Firmware:{'\n'}
+                • Arduino ESP32 (LGPL){'\n'}
+                • mbedTLS (Apache 2.0){'\n'}
+                • WebSockets (MIT)
+              </Text>
+            </ScrollView>
+            <TouchableOpacity style={[styles.button, { marginTop: 16 }]} onPress={() => setShowLicenses(false)}>
+              <Text style={styles.buttonText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
       </Modal>
     </ScrollView>
   );
@@ -788,41 +1321,131 @@ function ProfileTab({ setMessage }: { setMessage: (m: string) => void }) {
 function DashboardScreen() {
   const [activeTab, setActiveTab] = useState<'home' | 'analytics' | 'profile'>('home');
   const [message, setMessage] = useState('');
+  const settings = useSettingsStore();
+  const { disconnect } = useWalletStore();
+  const colors = settings.darkMode ? DARK_COLORS : LIGHT_COLORS;
+  const lastActivityRef = useRef(Date.now());
+
+  // Session timeout - auto disconnect after inactivity
+  useEffect(() => {
+    const checkTimeout = setInterval(() => {
+      const inactiveMs = Date.now() - lastActivityRef.current;
+      const timeoutMs = settings.sessionTimeout * 60 * 1000; // Convert minutes to ms
+
+      if (inactiveMs >= timeoutMs) {
+        Alert.alert(
+          'Session Timeout',
+          'You have been disconnected due to inactivity.',
+          [{ text: 'OK', onPress: () => disconnect() }]
+        );
+      }
+    }, 30000); // Check every 30 seconds
+
+    return () => clearInterval(checkTimeout);
+  }, [settings.sessionTimeout, disconnect]);
+
+  // Reset activity timer on any tap
+  const handleUserActivity = () => {
+    lastActivityRef.current = Date.now();
+  };
 
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, { backgroundColor: colors.bg }]} onTouchStart={handleUserActivity}>
       {message !== '' && (
-        <TouchableOpacity style={styles.messageBanner} onPress={() => setMessage('')} activeOpacity={0.8}>
-          <Text style={styles.messageText}>{message}</Text>
-          <Text style={styles.dismissHint}>Tap to dismiss</Text>
+        <TouchableOpacity style={[styles.messageBanner, { backgroundColor: colors.glass, borderColor: colors.border }]} onPress={() => setMessage('')} activeOpacity={0.8}>
+          <Text style={[styles.messageText, { color: colors.text }]}>{message}</Text>
+          <Text style={[styles.dismissHint, { color: colors.textMuted }]}>Tap to dismiss</Text>
         </TouchableOpacity>
       )}
 
       {activeTab === 'home' && <HomeTab setMessage={setMessage} />}
       {activeTab === 'analytics' && <AnalyticsTab />}
-      {activeTab === 'profile' && <ProfileTab setMessage={setMessage} />}
+      {activeTab === 'profile' && <SettingsTab setMessage={setMessage} />}
 
       {/* Frosted Glass Navigation Bar */}
       <View style={styles.navContainer}>
-        <View style={styles.navBar}>
+        <View style={[styles.navBar, { backgroundColor: colors.glass, borderColor: settings.darkMode ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)' }]}>
           <TouchableOpacity style={styles.navItem} onPress={() => setActiveTab('home')}>
             <HomeIcon active={activeTab === 'home'} />
-            <Text style={[styles.navLabel, activeTab === 'home' && styles.navLabelActive]}>Home</Text>
+            <Text style={[styles.navLabel, { color: activeTab === 'home' ? colors.primary : colors.textMuted }]}>Home</Text>
           </TouchableOpacity>
 
           <TouchableOpacity style={styles.navItem} onPress={() => setActiveTab('analytics')}>
             <ChartIcon active={activeTab === 'analytics'} />
-            <Text style={[styles.navLabel, activeTab === 'analytics' && styles.navLabelActive]}>Analytics</Text>
+            <Text style={[styles.navLabel, { color: activeTab === 'analytics' ? colors.primary : colors.textMuted }]}>Analytics</Text>
           </TouchableOpacity>
 
           <TouchableOpacity style={styles.navItem} onPress={() => setActiveTab('profile')}>
             <UserIcon active={activeTab === 'profile'} />
-            <Text style={[styles.navLabel, activeTab === 'profile' && styles.navLabelActive]}>Profile</Text>
+            <Text style={[styles.navLabel, { color: activeTab === 'profile' ? colors.primary : colors.textMuted }]}>Profile</Text>
           </TouchableOpacity>
         </View>
       </View>
 
-      <StatusBar style="light" />
+      <StatusBar style={settings.darkMode ? "light" : "dark"} />
+    </View>
+  );
+}
+
+// ===== BIOMETRIC LOCK SCREEN =====
+function BiometricLockScreen({ onUnlock }: { onUnlock: () => void }) {
+  const [checking, setChecking] = useState(true);
+
+  useEffect(() => {
+    checkBiometric();
+  }, []);
+
+  const checkBiometric = async () => {
+    try {
+      const LocalAuth = await import('expo-local-authentication');
+      const hasHardware = await LocalAuth.hasHardwareAsync();
+      const isEnrolled = await LocalAuth.isEnrolledAsync();
+
+      if (!hasHardware || !isEnrolled) {
+        // No biometrics available, just unlock
+        onUnlock();
+        return;
+      }
+
+      const result = await LocalAuth.authenticateAsync({
+        promptMessage: 'Unlock espresSol Wallet',
+        cancelLabel: 'Cancel',
+        fallbackLabel: 'Enter Passcode',
+        disableDeviceFallback: false,
+        requireConfirmation: false,
+      });
+
+      if (result.success) {
+        onUnlock();
+      }
+    } catch (e) {
+      console.log('Biometric error:', e);
+      // On error, allow unlock
+      onUnlock();
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  // Get current theme
+  const colors = useSettingsStore.getState().darkMode ? DARK_COLORS : LIGHT_COLORS;
+
+  return (
+    <View style={[styles.container, { backgroundColor: colors.bg, justifyContent: 'center', alignItems: 'center' }]}>
+      <EspressoLogo size={100} />
+      <Text style={[styles.title, { color: colors.text, marginTop: 24 }]}>espresSol</Text>
+      <Text style={[styles.subtitle, { color: colors.textMuted }]}>
+        {checking ? 'Authenticating...' : 'Tap to unlock'}
+      </Text>
+      {!checking && (
+        <TouchableOpacity
+          style={[styles.button, { marginTop: 32, width: 200 }]}
+          onPress={checkBiometric}
+        >
+          <Text style={styles.buttonText}>Unlock</Text>
+        </TouchableOpacity>
+      )}
+      {checking && <ActivityIndicator size="large" color={DARK_COLORS.primary} style={{ marginTop: 32 }} />}
     </View>
   );
 }
@@ -830,7 +1453,21 @@ function DashboardScreen() {
 // ===== MAIN APP =====
 export default function App() {
   const { connected } = useWalletStore();
-  return connected ? <DashboardScreen /> : <ConnectScreen />;
+  const settings = useSettingsStore();
+  const [, forceUpdate] = useState(0);
+
+  // Update COLORS and force re-render when theme changes
+  useEffect(() => {
+    COLORS = settings.darkMode ? DARK_COLORS : LIGHT_COLORS;
+    forceUpdate(n => n + 1); // Force re-render to apply new colors
+  }, [settings.darkMode]);
+
+  // Key forces full re-render when theme changes
+  return (
+    <View key={`theme-${settings.darkMode}`} style={{ flex: 1 }}>
+      {connected ? <DashboardScreen /> : <ConnectScreen />}
+    </View>
+  );
 }
 
 // ===== STYLES =====
@@ -883,7 +1520,8 @@ const styles = StyleSheet.create({
   addressShort: { color: COLORS.primary, fontSize: 18, fontWeight: '600' },
 
   // Actions
-  actionsRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 24 },
+  actionsCard: { backgroundColor: COLORS.card, borderRadius: 24, padding: 16, marginBottom: 24, borderWidth: 1, borderColor: COLORS.border },
+  actionsRow: { flexDirection: 'row', justifyContent: 'space-between' },
   actionBtn: { alignItems: 'center', flex: 1 },
   actionIconWrap: { backgroundColor: COLORS.card, width: 56, height: 56, borderRadius: 28, justifyContent: 'center', alignItems: 'center', marginBottom: 8, borderWidth: 1, borderColor: COLORS.border },
   actionLabel: { color: COLORS.textMuted, fontSize: 12 },
@@ -958,4 +1596,36 @@ const styles = StyleSheet.create({
   navItem: { alignItems: 'center', paddingHorizontal: 24, paddingVertical: 6 },
   navLabel: { color: COLORS.textMuted, fontSize: 11, marginTop: 4, fontWeight: '500' },
   navLabelActive: { color: COLORS.primary },
+
+  // Settings Page
+  sectionTitle: { color: COLORS.textMuted, fontSize: 12, fontWeight: '600', textTransform: 'uppercase', letterSpacing: 1, marginTop: 24, marginBottom: 12 },
+  settingsSection: { backgroundColor: COLORS.card, borderRadius: 16, padding: 16, marginBottom: 8, borderWidth: 1, borderColor: COLORS.border },
+  settingRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: COLORS.border + '50' },
+  settingLabel: { color: COLORS.text, fontSize: 14, flex: 1 },
+  settingValue: { color: COLORS.textMuted, fontSize: 14 },
+
+  // Toggle Switch
+  toggle: { width: 48, height: 28, borderRadius: 14, backgroundColor: COLORS.border, justifyContent: 'center', padding: 2 },
+  toggleActive: { backgroundColor: COLORS.primary },
+  toggleDot: { width: 24, height: 24, borderRadius: 12, backgroundColor: COLORS.text },
+  toggleDotActive: { alignSelf: 'flex-end' },
+
+  // Network Pills
+  networkPills: { flexDirection: 'row' },
+  networkPill: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16, backgroundColor: COLORS.border, marginLeft: 8 },
+  networkPillActive: { backgroundColor: COLORS.primary },
+  networkPillDisabled: { backgroundColor: COLORS.border + '50', opacity: 0.5 },
+  networkPillText: { color: COLORS.textMuted, fontSize: 12, fontWeight: '600' },
+  networkPillTextActive: { color: COLORS.text },
+  networkPillTextDisabled: { color: COLORS.textMuted + '80' },
+
+  // Slider
+  sliderRow: { flexDirection: 'row', alignItems: 'center', marginLeft: 8 },
+  sliderBtn: { width: 32, height: 32, borderRadius: 16, backgroundColor: COLORS.border, justifyContent: 'center', alignItems: 'center' },
+  sliderBtnText: { color: COLORS.text, fontSize: 18, fontWeight: '700' },
+  sliderTrack: { width: 80, height: 4, backgroundColor: COLORS.border, borderRadius: 2, marginHorizontal: 8 },
+  sliderFill: { height: 4, backgroundColor: COLORS.primary, borderRadius: 2 },
+
+  // License Text
+  licenseText: { color: COLORS.textMuted, fontSize: 12, lineHeight: 20 },
 });

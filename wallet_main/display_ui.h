@@ -1,9 +1,40 @@
 #pragma once
 #include <U8g2lib.h>
 #include <Arduino.h>
+#include "qrcode.h"
 extern U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2;
 extern const int BTN_OK;
 extern const int BTN_DOWN;
+
+// Display a QR code on the OLED (version 3 = 29x29 modules)
+inline void drawQRCode(const char* data) {
+  QRCode qrcode;
+  uint8_t qrcodeData[qrcode_getBufferSize(3)];
+  qrcode_initText(&qrcode, qrcodeData, 3, ECC_LOW, data);
+  
+  u8g2.clearBuffer();
+  
+  // Scale = 2 pixels per module, QR size = 29*2 = 58 pixels
+  // Center on 128x64 display: x offset = (128-58)/2 = 35, y offset = (64-58)/2 = 3
+  int scale = 2;
+  int qrSize = qrcode.size * scale;
+  int xOffset = (128 - qrSize) / 2;
+  int yOffset = (64 - qrSize) / 2;
+  
+  for (int y = 0; y < qrcode.size; y++) {
+    for (int x = 0; x < qrcode.size; x++) {
+      if (qrcode_getModule(&qrcode, x, y)) {
+        u8g2.drawBox(xOffset + x * scale, yOffset + y * scale, scale, scale);
+      }
+    }
+  }
+  u8g2.sendBuffer();
+}
+
+// Display QR code for IP:port pairing
+inline void displayIPQRCode(const String& ipWithPort) {
+  drawQRCode(ipWithPort.c_str());
+}
 
 inline void drawCentered(const char* msg, int yOffset) {
   u8g2.clearBuffer();
