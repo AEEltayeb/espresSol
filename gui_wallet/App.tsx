@@ -1,3 +1,8 @@
+// Buffer polyfill for React Native
+import { Buffer } from 'buffer';
+global.Buffer = Buffer;
+import bs58 from 'bs58';
+
 import { StatusBar } from 'expo-status-bar';
 import { useState, useEffect } from 'react';
 import {
@@ -22,6 +27,7 @@ import * as Clipboard from 'expo-clipboard';
 import Svg, { Path, Circle, G, Rect } from 'react-native-svg';
 import { useWalletStore } from './src/store/walletStore';
 import { walletService } from './src/services/WalletService';
+import { solanaService } from './src/services/SolanaService';
 
 const COLORS = {
   bg: '#0a0a12',
@@ -38,18 +44,60 @@ const COLORS = {
 
 // ===== SVG ICONS =====
 const EspressoLogo = ({ size = 48 }: { size?: number }) => (
-  <Svg width={size} height={size} viewBox="0 0 64 64">
-    {/* Cup */}
-    <Path d="M16 28 L48 28 L44 56 C43 58 41 60 38 60 L26 60 C23 60 21 58 20 56 Z" fill={COLORS.secondary} />
-    <Path d="M18 28 L46 28 L43 54 C42.5 55.5 41 57 38 57 L26 57 C23 57 21.5 55.5 21 54 Z" fill="#d4b78d" />
+  <Svg width={size} height={size} viewBox="0 0 512 512">
+    {/* Steam ribbons - floating higher */}
+    <Path
+      d="M270 20c-30 35-18 60 12 88 28 26 32 48 8 72"
+      stroke={COLORS.primary}
+      strokeWidth="16"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      fill="none"
+      opacity="0.5"
+    />
+    <Path
+      d="M230 40c-24 30-14 50 10 74 22 22 26 40 6 60"
+      stroke={COLORS.primary}
+      strokeWidth="20"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      fill="none"
+    />
+    {/* Cup body - connected path including rim */}
+    <Path
+      d="M160 210 L352 210 L352 290 C352 340 306 380 256 380 C206 380 160 340 160 290 Z"
+      stroke={COLORS.primary}
+      strokeWidth="20"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      fill="none"
+    />
     {/* Handle */}
-    <Path d="M48 32 Q58 32 58 42 Q58 52 48 52" stroke={COLORS.secondary} strokeWidth="4" fill="none" />
-    {/* Coffee */}
-    <Rect x="20" y="30" width="24" height="6" rx="2" fill="#5c3d2e" />
-    {/* Steam */}
-    <Path d="M28 8 Q26 14 28 20 Q30 26 28 28" stroke={COLORS.textMuted} strokeWidth="2" fill="none" opacity="0.6" />
-    <Path d="M36 4 Q34 12 36 18 Q38 24 36 28" stroke={COLORS.textMuted} strokeWidth="2" fill="none" opacity="0.6" />
-    <Path d="M32 10 Q30 16 32 22 Q34 26 32 28" stroke={COLORS.textMuted} strokeWidth="2" fill="none" opacity="0.4" />
+    <Path
+      d="M352 240 C400 240 420 260 420 290 C420 320 400 340 352 340"
+      stroke={COLORS.primary}
+      strokeWidth="20"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      fill="none"
+    />
+    {/* Saucer - main curve */}
+    <Path
+      d="M120 410 Q256 470 392 410"
+      stroke={COLORS.primary}
+      strokeWidth="20"
+      strokeLinecap="round"
+      fill="none"
+    />
+    {/* Saucer shadow - parallel curve with proper spacing */}
+    <Path
+      d="M140 445 Q256 495 372 445"
+      stroke={COLORS.primary}
+      strokeWidth="14"
+      strokeLinecap="round"
+      fill="none"
+      opacity="0.4"
+    />
   </Svg>
 );
 
@@ -196,6 +244,28 @@ function HomeTab({ setMessage }: { setMessage: (m: string) => void }) {
   const [sendAmount, setSendAmount] = useState('');
   const [sending, setSending] = useState(false);
   const [airdropLoading, setAirdropLoading] = useState(false);
+  const [recentAddresses, setRecentAddresses] = useState<string[]>([]);
+
+  // Fetch recent addresses when send modal opens
+  useEffect(() => {
+    if (showSend && publicKey) {
+      const fetchRecent = async () => {
+        try {
+          const txs = await solanaService.getTransactionHistory(publicKey, 20);
+          // Get unique addresses we sent TO (not ourselves)
+          const sentTo = txs
+            .filter(tx => tx.type === 'send' && tx.otherParty !== publicKey)
+            .map(tx => tx.otherParty)
+            .filter((addr, idx, arr) => arr.indexOf(addr) === idx)
+            .slice(0, 3);
+          setRecentAddresses(sentTo);
+        } catch (e) {
+          console.log('[Send] Could not fetch recent addresses');
+        }
+      };
+      fetchRecent();
+    }
+  }, [showSend, publicKey]);
 
   const onRefresh = async () => {
     setRefreshing(true);
@@ -252,45 +322,86 @@ function HomeTab({ setMessage }: { setMessage: (m: string) => void }) {
       setMessage('Enter address and amount');
       return;
     }
-    const lamports = Math.floor(parseFloat(sendAmount) * 1e9);
+
+    // Validate recipient address
+    if (!solanaService.isValidAddress(sendAddress)) {
+      setMessage('Invalid Solana address');
+      return;
+    }
+
+    // Convert comma to dot for European number format support
+    const normalizedAmount = sendAmount.replace(',', '.');
+    const lamports = Math.floor(parseFloat(normalizedAmount) * 1e9);
     if (isNaN(lamports) || lamports <= 0) {
       setMessage('Invalid amount');
       return;
     }
+
+    if (lamports > balance) {
+      setMessage('Insufficient balance');
+      return;
+    }
+
     setSending(true);
     setShowSend(false);
     setMessage('Building transaction...');
+
     try {
-      const bhResp = await fetch('https://api.devnet.solana.com', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0', id: 1,
-          method: 'getLatestBlockhash',
-          params: [{ commitment: 'finalized' }],
-        }),
-      });
-      const bhData = await bhResp.json();
-      const blockhash = bhData.result?.value?.blockhash;
-      if (!blockhash) throw new Error('Failed to get blockhash');
+      // Prepare transfer message for ESP32 signing
+      const { messageHex, blockhash, messageBytes } = await solanaService.prepareTransfer(
+        publicKey,
+        sendAddress,
+        lamports
+      );
 
-      const messageToSign = JSON.stringify({
-        type: 'transfer', from: publicKey, to: sendAddress, amount: lamports, blockhash,
-      });
-      const msgHex = Buffer.from(messageToSign).toString('hex');
-
+      // Send to ESP32 for signing
       setMessage('Confirm on device...');
-      const signature = await walletService.sign(msgHex);
+      console.log('[Send] Message hex length:', messageHex.length);
 
-      if (signature) {
-        setMessage('Transaction signed!');
-        setSendAddress('');
-        setSendAmount('');
-        setTimeout(() => { refreshBalance(); setMessage(''); }, 2000);
+      const signatureB58 = await walletService.sign(messageHex);
+
+      if (!signatureB58) {
+        throw new Error('No signature returned');
       }
+
+      console.log('[Send] Received signature:', signatureB58.slice(0, 20) + '...');
+
+      // Convert signature from Base58 to hex for broadcast
+      setMessage('Broadcasting to Solana...');
+      const sigBytes = bs58.decode(signatureB58);
+      const sigHex = Buffer.from(sigBytes).toString('hex');
+
+      // Broadcast the signed transaction
+      const txSignature = await solanaService.sendSignedTransaction(messageBytes, sigHex);
+
+      console.log('[Send] Transaction broadcast! Sig:', txSignature);
+      setMessage(`Success! TX: ${txSignature.slice(0, 12)}...`);
+      setSendAddress('');
+      setSendAmount('');
+
+      // Refresh balance after a delay
+      setTimeout(async () => {
+        await refreshBalance();
+      }, 3000);
+
+      // Clear message after showing success
+      setTimeout(() => {
+        setMessage('');
+      }, 8000);
+
     } catch (e: any) {
-      setMessage('Error: ' + e.message);
+      console.error('[Send] Error:', e);
+      if (e.message === 'rejected') {
+        setMessage('Transaction rejected on device');
+      } else if (e.message?.includes('timeout')) {
+        setMessage('Signing timed out - try again');
+      } else if (e.message?.includes('blockhash')) {
+        setMessage('Transaction expired - try again');
+      } else {
+        setMessage('Error: ' + e.message);
+      }
     }
+
     setSending(false);
   };
 
@@ -351,6 +462,25 @@ function HomeTab({ setMessage }: { setMessage: (m: string) => void }) {
           <View style={styles.modalOverlay}>
             <View style={styles.modalContent}>
               <Text style={styles.modalTitle}>Send SOL</Text>
+
+              {/* Recent Addresses Pills */}
+              {recentAddresses.length > 0 && (
+                <View style={styles.recentRow}>
+                  <Text style={styles.recentLabel}>Recent:</Text>
+                  {recentAddresses.map((addr) => (
+                    <TouchableOpacity
+                      key={addr}
+                      style={styles.recentPill}
+                      onPress={() => setSendAddress(addr)}
+                    >
+                      <Text style={styles.recentPillText}>
+                        {addr.slice(0, 4)}...{addr.slice(-4)}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              )}
+
               <TextInput style={styles.input} value={sendAddress} onChangeText={setSendAddress} placeholder="Recipient address" placeholderTextColor={COLORS.textMuted} autoCapitalize="none" />
               <TextInput style={[styles.input, { marginTop: 12 }]} value={sendAmount} onChangeText={setSendAmount} placeholder="Amount (SOL)" placeholderTextColor={COLORS.textMuted} keyboardType="decimal-pad" />
               <Text style={styles.hint}>Balance: {solBalance.toFixed(4)} SOL</Text>
@@ -368,14 +498,62 @@ function HomeTab({ setMessage }: { setMessage: (m: string) => void }) {
   );
 }
 
-// ===== ANALYTICS TAB =====
 function AnalyticsTab() {
-  const { balance, balanceHistory, solPrice, balanceUSD } = useWalletStore();
+  const { balance, balanceHistory, solPrice, balanceUSD, publicKey } = useWalletStore();
   const solBalance = balance / 1e9;
+  const [transactions, setTransactions] = useState<Array<{
+    signature: string;
+    type: 'send' | 'receive' | 'unknown';
+    amount: number;
+    otherParty: string;
+    blockTime: number | null;
+  }>>([]);
+  const [loadingTx, setLoadingTx] = useState(false);
+
+  // Fetch real transactions from Solana
+  useEffect(() => {
+    if (!publicKey) return;
+
+    const fetchTransactions = async () => {
+      setLoadingTx(true);
+      try {
+        const txs = await solanaService.getTransactionHistory(publicKey, 10);
+        setTransactions(txs);
+      } catch (e) {
+        console.error('[Analytics] Error fetching transactions:', e);
+      }
+      setLoadingTx(false);
+    };
+
+    fetchTransactions();
+
+    // Auto-refresh every 30 seconds
+    const interval = setInterval(fetchTransactions, 30000);
+    return () => clearInterval(interval);
+  }, [publicKey]);
+
+  // Prepare chart data - ensure at least 2 points and handle zero values
+  const chartValues = balanceHistory.length > 0
+    ? balanceHistory.map(h => Math.max(h.balance / 1e9, 0.0001))
+    : [solBalance || 0.0001, solBalance || 0.0001];
+
+  const chartLabels = balanceHistory.length > 0
+    ? balanceHistory.map(h => h.date.slice(5, 10))
+    : ['Start', 'Now'];
 
   const chartData = {
-    labels: balanceHistory.length > 0 ? balanceHistory.map(h => h.date.slice(5, 10)) : ['Now'],
-    datasets: [{ data: balanceHistory.length > 0 ? balanceHistory.map(h => h.balance / 1e9) : [solBalance] }],
+    labels: chartLabels,
+    datasets: [{ data: chartValues, strokeWidth: 2 }],
+  };
+
+  // Format time ago
+  const timeAgo = (timestamp: number | null) => {
+    if (!timestamp) return 'Unknown';
+    const seconds = Math.floor(Date.now() / 1000 - timestamp);
+    if (seconds < 60) return 'Just now';
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+    return `${Math.floor(seconds / 86400)}d ago`;
   };
 
   return (
@@ -400,28 +578,66 @@ function AnalyticsTab() {
           <Text style={styles.statLabel}>SOL Price</Text>
         </View>
         <View style={styles.statCard}>
-          <Text style={styles.statValue}>{balanceHistory.length}</Text>
-          <Text style={styles.statLabel}>Days Tracked</Text>
+          <Text style={styles.statValue}>{transactions.length}</Text>
+          <Text style={styles.statLabel}>Transactions</Text>
         </View>
       </View>
 
-      <Text style={styles.chartTitle}>Balance History</Text>
+      <Text style={styles.chartTitle}>Balance History (SOL)</Text>
       <LineChart
         data={chartData}
         width={Dimensions.get('window').width - 40}
-        height={200}
+        height={180}
+        yAxisSuffix=""
+        yAxisLabel=""
         chartConfig={{
           backgroundColor: COLORS.card,
           backgroundGradientFrom: COLORS.card,
           backgroundGradientTo: COLORS.bg,
-          decimalPlaces: 3,
+          decimalPlaces: 2,
           color: (opacity = 1) => `rgba(139, 92, 246, ${opacity})`,
           labelColor: () => COLORS.textMuted,
-          propsForDots: { r: '4', strokeWidth: '2', stroke: COLORS.primary },
+          propsForDots: { r: '5', strokeWidth: '2', stroke: COLORS.primary },
+          propsForBackgroundLines: { strokeDasharray: '', stroke: COLORS.border },
+          fillShadowGradientFrom: COLORS.primary,
+          fillShadowGradientTo: 'transparent',
+          fillShadowGradientOpacity: 0.3,
         }}
         bezier
         style={styles.chart}
+        fromZero={true}
       />
+
+      {/* Transactions Section */}
+      <Text style={[styles.chartTitle, { marginTop: 24 }]}>Recent Transactions</Text>
+      {loadingTx ? (
+        <View style={styles.emptyState}>
+          <ActivityIndicator color={COLORS.primary} />
+        </View>
+      ) : transactions.length === 0 ? (
+        <View style={styles.emptyState}>
+          <Text style={styles.emptyStateText}>No transactions yet</Text>
+        </View>
+      ) : (
+        transactions.map((tx) => (
+          <View key={tx.signature} style={styles.txItem}>
+            <View style={[styles.txIcon, tx.type === 'receive' ? styles.txIconReceive : styles.txIconSend]}>
+              <Text style={styles.txIconText}>{tx.type === 'receive' ? '↓' : '↑'}</Text>
+            </View>
+            <View style={styles.txDetails}>
+              <Text style={styles.txTitle}>
+                {tx.type === 'receive'
+                  ? `From ${tx.otherParty.slice(0, 6)}...`
+                  : `To ${tx.otherParty.slice(0, 6)}...`}
+              </Text>
+              <Text style={styles.txDate}>{timeAgo(tx.blockTime)}</Text>
+            </View>
+            <Text style={[styles.txAmount, tx.type === 'receive' ? styles.txAmountReceive : styles.txAmountSend]}>
+              {tx.type === 'receive' ? '+' : '-'}{(tx.amount / 1e9).toFixed(4)} SOL
+            </Text>
+          </View>
+        ))
+      )}
     </ScrollView>
   );
 }
@@ -429,6 +645,45 @@ function AnalyticsTab() {
 // ===== PROFILE TAB =====
 function ProfileTab({ setMessage }: { setMessage: (m: string) => void }) {
   const { publicKey, disconnect } = useWalletStore();
+  const [showRecover, setShowRecover] = useState(false);
+  const [words, setWords] = useState<string[]>(Array(12).fill(''));
+  const [recovering, setRecovering] = useState(false);
+
+  const handleRecovery = async () => {
+    // Validate all words are entered
+    const cleanWords = words.map(w => w.trim().toLowerCase());
+    if (cleanWords.some(w => !w)) {
+      setMessage('Please enter all 12 words');
+      return;
+    }
+
+    setRecovering(true);
+    setShowRecover(false);
+    setMessage('Recovering wallet...');
+
+    try {
+      const success = await walletService.recover(cleanWords);
+      if (success) {
+        setMessage('Recovery successful! Device restarting...');
+        setWords(Array(12).fill(''));
+        // Disconnect since device will restart
+        setTimeout(() => {
+          disconnect();
+        }, 3000);
+      } else {
+        setMessage('Recovery failed - check words');
+      }
+    } catch (e: any) {
+      setMessage('Error: ' + e.message);
+    }
+    setRecovering(false);
+  };
+
+  const updateWord = (index: number, value: string) => {
+    const newWords = [...words];
+    newWords[index] = value.toLowerCase().trim();
+    setWords(newWords);
+  };
 
   return (
     <ScrollView style={styles.tabContent} contentContainerStyle={styles.scrollContent}>
@@ -456,6 +711,11 @@ function ProfileTab({ setMessage }: { setMessage: (m: string) => void }) {
         <Text style={styles.menuText}>Backup Phrase</Text>
       </TouchableOpacity>
 
+      <TouchableOpacity style={styles.menuItem} onPress={() => setShowRecover(true)}>
+        <Text style={styles.menuIconText}>🔄</Text>
+        <Text style={styles.menuText}>Recover Wallet</Text>
+      </TouchableOpacity>
+
       <TouchableOpacity style={styles.menuItem} onPress={() => setMessage('Network: Devnet')}>
         <Text style={styles.menuIconText}>🌐</Text>
         <Text style={styles.menuText}>Network</Text>
@@ -470,6 +730,56 @@ function ProfileTab({ setMessage }: { setMessage: (m: string) => void }) {
         <Text style={styles.menuIconText}>🚪</Text>
         <Text style={[styles.menuText, { color: COLORS.error }]}>Disconnect</Text>
       </TouchableOpacity>
+
+      {/* Recovery Modal */}
+      <Modal visible={showRecover} transparent animationType="slide">
+        <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+          <View style={styles.modalOverlay}>
+            <View style={[styles.modalContent, { maxHeight: '90%' }]}>
+              <Text style={styles.modalTitle}>Recover Wallet</Text>
+              <Text style={[styles.hint, { marginBottom: 16 }]}>
+                Enter your 12-word backup phrase to restore wallet on the hardware device.
+              </Text>
+
+              <ScrollView style={{ maxHeight: 300 }}>
+                {words.map((word, index) => (
+                  <View key={index} style={styles.wordInputRow}>
+                    <Text style={styles.wordNumber}>{index + 1}.</Text>
+                    <TextInput
+                      style={[styles.input, styles.wordInput]}
+                      value={word}
+                      onChangeText={(val) => updateWord(index, val)}
+                      placeholder={`Word ${index + 1}`}
+                      placeholderTextColor={COLORS.textMuted}
+                      autoCapitalize="none"
+                      autoCorrect={false}
+                    />
+                  </View>
+                ))}
+              </ScrollView>
+
+              <TouchableOpacity
+                style={[styles.button, { marginTop: 16 }]}
+                onPress={handleRecovery}
+                disabled={recovering}
+              >
+                {recovering ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <Text style={styles.buttonText}>Recover</Text>
+                )}
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.button, styles.cancelButton, { marginTop: 8 }]}
+                onPress={() => setShowRecover(false)}
+              >
+                <Text style={styles.buttonText}>Cancel</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </TouchableWithoutFeedback>
+      </Modal>
     </ScrollView>
   );
 }
@@ -583,6 +893,12 @@ const styles = StyleSheet.create({
   modalContent: { backgroundColor: COLORS.card, borderRadius: 24, padding: 28, borderWidth: 1, borderColor: COLORS.border },
   modalTitle: { color: COLORS.text, fontSize: 24, fontWeight: '700', marginBottom: 24, textAlign: 'center' },
 
+  // Recent Address Pills
+  recentRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap' },
+  recentLabel: { color: COLORS.textMuted, fontSize: 12, marginRight: 8 },
+  recentPill: { backgroundColor: COLORS.primary + '30', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16, marginRight: 8, marginBottom: 4, borderWidth: 1, borderColor: COLORS.primary + '50' },
+  recentPillText: { color: COLORS.primary, fontSize: 12, fontWeight: '600' },
+
   // Analytics
   statsGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', marginBottom: 24 },
   statCard: { width: '48%', backgroundColor: COLORS.card, borderRadius: 16, padding: 16, marginBottom: 12, alignItems: 'center', borderWidth: 1, borderColor: COLORS.border },
@@ -601,6 +917,26 @@ const styles = StyleSheet.create({
   menuIconText: { fontSize: 20, marginRight: 14 },
   menuText: { color: COLORS.text, fontSize: 16, marginLeft: 12 },
   dangerItem: { borderColor: COLORS.error + '50' },
+
+  // Recovery Word Input
+  wordInputRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
+  wordNumber: { color: COLORS.textMuted, fontSize: 14, width: 30 },
+  wordInput: { flex: 1, marginBottom: 0, padding: 12 },
+
+  // Transactions
+  txItem: { flexDirection: 'row', alignItems: 'center', backgroundColor: COLORS.card, borderRadius: 16, padding: 16, marginBottom: 12, borderWidth: 1, borderColor: COLORS.border },
+  txIcon: { width: 40, height: 40, borderRadius: 20, justifyContent: 'center', alignItems: 'center', marginRight: 12 },
+  txIconReceive: { backgroundColor: COLORS.success + '30' },
+  txIconSend: { backgroundColor: COLORS.error + '30' },
+  txIconText: { fontSize: 18 },
+  txDetails: { flex: 1 },
+  txTitle: { color: COLORS.text, fontSize: 14, fontWeight: '600' },
+  txDate: { color: COLORS.textMuted, fontSize: 12, marginTop: 2 },
+  txAmount: { fontSize: 14, fontWeight: '700' },
+  txAmountReceive: { color: COLORS.success },
+  txAmountSend: { color: COLORS.error },
+  emptyState: { alignItems: 'center', padding: 32 },
+  emptyStateText: { color: COLORS.textMuted, fontSize: 14 },
 
   // Navigation Bar - Frosted Glass Pill
   navContainer: { position: 'absolute', bottom: 24, left: 24, right: 24 },

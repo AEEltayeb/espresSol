@@ -1426,6 +1426,13 @@ void setup() {
     // EXISTING encrypted wallet - verify PIN
     loadPINSalt(prefs, pin_salt);
     
+    // Debug: Show first 8 bytes of stored encrypted key
+    uint8_t debug_enc[48];
+    prefs.getBytes("enc_sk", debug_enc, 48);
+    Serial.print("[Boot] enc_sk first 8 bytes: ");
+    for (int i = 0; i < 8; i++) Serial.printf("%02X", debug_enc[i]);
+    Serial.println();
+    
     while (!pin_verified && pin_attempts < MAX_PIN_ATTEMPTS) {
       drawCentered("Enter PIN", -10);
       char attemptStr[20];
@@ -1446,6 +1453,11 @@ void setup() {
       if (loadEncryptedKey(prefs, pin_key, ed25519_sk, ed25519_pk)) {
         pin_verified = true;
         last_activity_time = millis();  // Initialize session timer
+        
+        // Debug: Show loaded pubkey
+        Serial.print("[Key] Loaded pubkey: ");
+        for (int i = 0; i < 32; i++) Serial.printf("%02X", ed25519_pk[i]);
+        Serial.println();
         
         // Clear failed attempts on success
         prefs.putInt("pin_fails", 0);
@@ -1727,33 +1739,36 @@ void loop() {
                   
                   if (hasWords) {
                     drawCentered("Recovering...", 0);
-                    // Generate new key from mnemonic
-                    uint8_t entropy[32]; // Not used but needed by API
-                    mnemonicToEntropy(words, entropy);
-                    
-                    uint8_t sk[32], pk[32];
-                    entropyToKey(entropy, sk);
-                    ed25519_publickey(sk, pk);
-                    
-                    // We need PIN to re-encrypt
-                    // This is tricky - we need to ask user for PIN on device
-                    // Or reuse existing PIN if verified? 
-                    // Let's assume we reuse existing PIN if verified, otherwise ask
-                    if (!pin_verified) {
-                       // This flows is complex for remote recovery.
-                       // For now, let's assume device is unlocked (pin_verified=true)
-                       // If not, we should reject or ask for PIN
-                       tlsClient->println("{\"ok\":false,\"error\":\"device_locked\"}");
+                    // Convert mnemonic to entropy with validation
+                    uint8_t entropy[12];
+                    if (!mnemonicToEntropy(words, entropy)) {
+                      tlsClient->println("{\"ok\":false,\"error\":\"invalid_mnemonic\"}");
+                      drawCentered("Invalid words!", 0);
+                      delay(2000);
                     } else {
-                       // Re-encrypt and store
-                       if (generateAndStoreEncryptedKey(prefs, pin_key, pin_salt, sk, pk, words)) {
-                         tlsClient->println("{\"ok\":true}");
-                         drawCentered("Recovered!", 0);
-                         delay(2000);
-                         ESP.restart();
-                       } else {
-                         tlsClient->println("{\"ok\":false,\"error\":\"storage_failed\"}");
-                       }
+                      uint8_t sk[32], pk[32];
+                      entropyToKey(entropy, sk);
+                      ed25519_publickey(sk, pk);
+                      
+                      if (!pin_verified) {
+                         tlsClient->println("{\"ok\":false,\"error\":\"device_locked\"}");
+                      } else {
+                         // Use storeRecoveredKey to save the recovered key
+                         if (storeRecoveredKey(prefs, pin_key, pin_salt, sk, pk, words)) {
+                           // Update global variables
+                           memcpy(ed25519_sk, sk, 32);
+                           memcpy(ed25519_pk, pk, 32);
+                           for (int i = 0; i < 12; i++) {
+                             mnemonicWords[i] = words[i];
+                           }
+                           tlsClient->println("{\"ok\":true}");
+                           drawCentered("Recovered!", 0);
+                           delay(2000);
+                           ESP.restart();
+                         } else {
+                           tlsClient->println("{\"ok\":false,\"error\":\"storage_failed\"}");
+                         }
+                      }
                     }
                   } else {
                     tlsClient->println("{\"ok\":false,\"error\":\"missing_words\"}");
@@ -1848,7 +1863,13 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
   
   // PUBKEY
   if (strcmp(cmd, "PUBKEY") == 0) {
+    // Debug: Show what ed25519_pk contains
+    Serial.print("[PUBKEY] ed25519_pk bytes: ");
+    for (int i = 0; i < 32; i++) Serial.printf("%02X", ed25519_pk[i]);
+    Serial.println();
+    
     String pubkeyB58 = bytesToBase58(ed25519_pk, 32);
+    Serial.println("[PUBKEY] Base58: " + pubkeyB58);
     String resp = "{\"ok\":true,\"pubkey\":\"" + pubkeyB58 + "\"}";
     wsServer.sendTXT(num, resp);
   }
@@ -1963,20 +1984,64 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
     
     if (hasWords) {
       drawCentered("Recovering...", 0);
-      uint8_t entropy[32];
-      mnemonicToEntropy(words, entropy);
       
+      // Convert mnemonic to entropy (skip checksum for recovery flexibility)
+      uint8_t entropy[12];
+      bool allWordsValid = true;
+      for (int i = 0; i < 12 && allWordsValid; i++) {
+        bool found = false;
+        for (int j = 0; j < 256; j++) {
+          const char* word = (const char*)pgm_read_ptr(&MNEMONIC_WORDS[j]);
+          if (words[i].equals(word)) {
+            entropy[i] = j;
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          allWordsValid = false;
+          Serial.println("[WS] Invalid word: " + words[i]);
+        }
+      }
+      
+      if (!allWordsValid) {
+        wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"invalid_word\"}");
+        drawCentered("Invalid word!", 0);
+        delay(2000);
+        return;
+      }
+      
+      // Derive key from entropy
       uint8_t sk[32], pk[32];
       entropyToKey(entropy, sk);
       ed25519_publickey(sk, pk);
       
-      if (generateAndStoreEncryptedKey(prefs, pin_key, pin_salt, sk, pk, words)) {
+      // Debug: Show derived pubkey
+      Serial.print("[RECOVERY] New pubkey bytes: ");
+      for (int i = 0; i < 32; i++) Serial.printf("%02X", pk[i]);
+      Serial.println();
+      
+      // Close and reopen prefs to ensure write access
+      prefs.end();
+      prefs.begin("wallet", false);  // false = read-write mode
+      
+      // Store the RECOVERED key (uses storeRecoveredKey, NOT generateAndStoreEncryptedKey)
+      if (storeRecoveredKey(prefs, pin_key, pin_salt, sk, pk, words)) {
+        // Also update the global key variables
+        memcpy(ed25519_sk, sk, 32);
+        memcpy(ed25519_pk, pk, 32);
+        for (int i = 0; i < 12; i++) {
+          mnemonicWords[i] = words[i];
+        }
+        
         wsServer.sendTXT(num, "{\"ok\":true}");
         drawCentered("Recovered!", 0);
         delay(2000);
         ESP.restart();
       } else {
         wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"storage_failed\"}");
+        drawCentered("Storage error!", 0);
+        delay(2000);
       }
     } else {
       wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"missing_words\"}");

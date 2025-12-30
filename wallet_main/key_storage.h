@@ -111,6 +111,77 @@ inline bool generateAndStoreEncryptedKey(Preferences& prefs, const uint8_t pinKe
   return true;
 }
 
+// Store RECOVERED key with provided sk/pk/mnemonic (no new generation)
+inline bool storeRecoveredKey(Preferences& prefs, const uint8_t pinKey[16],
+                               const uint8_t salt[16],
+                               const uint8_t sk[32], const uint8_t pk[32], 
+                               const String mnemonic[12]) {
+  Serial.println("[RECOVERY] storeRecoveredKey called");
+  Serial.print("[RECOVERY] Mnemonic: ");
+  for (int i = 0; i < 12; i++) {
+    Serial.print(mnemonic[i]);
+    Serial.print(" ");
+  }
+  Serial.println();
+  
+  // Encrypt private key with PIN-derived key
+  // Encrypt private key with PIN-derived key
+  uint8_t encrypted[48];
+  uint8_t iv[12];
+  esp_fill_random(iv, 12);
+  
+  mbedtls_gcm_context gcm;
+  mbedtls_gcm_init(&gcm);
+  mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, pinKey, 128);
+  
+  uint8_t tag[16];
+  int ret = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, 32,
+                                       iv, 12, NULL, 0, sk, encrypted, 16, tag);
+  mbedtls_gcm_free(&gcm);
+  
+  if (ret != 0) return false;
+  
+  memcpy(encrypted + 32, tag, 16);
+  
+  // Store encrypted key, IV, and salt
+  size_t wrote1 = prefs.putBytes("enc_sk", encrypted, 48);
+  size_t wrote2 = prefs.putBytes("sk_iv", iv, 12);
+  size_t wrote3 = prefs.putBytes("pin_salt", salt, 16);
+  
+  Serial.printf("[RECOVERY] Stored enc_sk=%d, sk_iv=%d, pin_salt=%d bytes\n", wrote1, wrote2, wrote3);
+  
+  // Encrypt and store mnemonic
+  String mnemonicStr = "";
+  for (int i = 0; i < 12; i++) {
+    if (i > 0) mnemonicStr += " ";
+    mnemonicStr += mnemonic[i];
+  }
+  
+  // Encrypt mnemonic with same key
+  uint8_t mnem_iv[12];
+  esp_fill_random(mnem_iv, 12);
+  
+  uint8_t mnem_ct[256];
+  uint8_t mnem_tag[16];
+  
+  mbedtls_gcm_context gcm2;
+  mbedtls_gcm_init(&gcm2);
+  mbedtls_gcm_setkey(&gcm2, MBEDTLS_CIPHER_ID_AES, pinKey, 128);
+  mbedtls_gcm_crypt_and_tag(&gcm2, MBEDTLS_GCM_ENCRYPT, mnemonicStr.length(),
+                             mnem_iv, 12, NULL, 0,
+                             (const uint8_t*)mnemonicStr.c_str(), mnem_ct,
+                             16, mnem_tag);
+  mbedtls_gcm_free(&gcm2);
+  
+  prefs.putBytes("enc_mnem", mnem_ct, mnemonicStr.length());
+  prefs.putBytes("mnem_iv", mnem_iv, 12);
+  prefs.putBytes("mnem_tag", mnem_tag, 16);
+  prefs.putInt("mnem_len", mnemonicStr.length());
+  
+  Serial.println("[RECOVERY] storeRecoveredKey COMPLETE - returning true");
+  return true;
+}
+
 // Migrate legacy plain key to encrypted storage
 inline bool migratePlainKeyToEncrypted(Preferences& prefs, const uint8_t pinKey[16],
                                         const uint8_t salt[16],

@@ -1,37 +1,33 @@
 /**
- * SolanaService - Handles Solana transaction building and broadcasting
- * Mirrors the Python wallet_cli.py functionality  
+ * SolanaService - Full Solana Transaction Support for React Native
+ * Uses direct RPC calls with proper transaction serialization
  */
-import {
-    Connection,
-    PublicKey,
-    Transaction,
-    SystemProgram,
-    LAMPORTS_PER_SOL,
-} from '@solana/web3.js';
-import { Buffer } from 'buffer';
-import base58 from 'bs58';
-
-// Polyfill Buffer for React Native
-global.Buffer = Buffer;
+import bs58 from 'bs58';
 
 const RPC_URL = 'https://api.devnet.solana.com';
 
+// System Program ID (for transfers)
+const SYSTEM_PROGRAM_ID = '11111111111111111111111111111111';
+
 class SolanaService {
-    private connection: Connection;
-
-    constructor() {
-        this.connection = new Connection(RPC_URL, 'confirmed');
-    }
-
     // Get balance in lamports
-    async getBalance(pubkeyString: string): Promise<number> {
+    async getBalance(pubkey: string): Promise<number> {
         try {
-            const pubkey = new PublicKey(pubkeyString);
-            return await this.connection.getBalance(pubkey);
+            const resp = await fetch(RPC_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    method: 'getBalance',
+                    params: [pubkey],
+                }),
+            });
+            const data = await resp.json();
+            return data.result?.value || 0;
         } catch (e) {
             console.error('[Solana] Balance error:', e);
-            throw e;
+            return 0;
         }
     }
 
@@ -49,143 +45,347 @@ class SolanaService {
     }
 
     // Request airdrop (devnet only)
-    async requestAirdrop(pubkeyString: string, lamports: number = LAMPORTS_PER_SOL): Promise<string> {
+    async requestAirdrop(pubkey: string, lamports: number = 1e9): Promise<string> {
         try {
-            const pubkey = new PublicKey(pubkeyString);
-            const signature = await this.connection.requestAirdrop(pubkey, lamports);
-            await this.connection.confirmTransaction(signature, 'confirmed');
-            return signature;
+            const resp = await fetch(RPC_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    method: 'requestAirdrop',
+                    params: [pubkey, lamports],
+                }),
+            });
+            const data = await resp.json();
+            if (data.error) {
+                throw new Error(data.error.message);
+            }
+            return data.result;
         } catch (e: any) {
-            console.error('[Solana] Airdrop error:', e);
             throw new Error(e.message || 'Airdrop failed');
         }
     }
 
-    // Build transfer transaction and return message bytes for signing
-    async buildTransferTransaction(
-        fromPubkeyString: string,
-        toPubkeyString: string,
-        lamports: number
-    ): Promise<{ transaction: Transaction; messageBytes: Buffer; blockhash: string }> {
-        try {
-            const fromPubkey = new PublicKey(fromPubkeyString);
-            const toPubkey = new PublicKey(toPubkeyString);
-
-            // Get latest blockhash
-            const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash('finalized');
-
-            // Create transfer instruction
-            const transferInstruction = SystemProgram.transfer({
-                fromPubkey,
-                toPubkey,
-                lamports,
-            });
-
-            // Build transaction
-            const transaction = new Transaction({
-                feePayer: fromPubkey,
-                blockhash,
-                lastValidBlockHeight,
-            });
-            transaction.add(transferInstruction);
-
-            // Get the message bytes for signing
-            const messageBytes = transaction.serializeMessage();
-
-            console.log('[Solana] Transaction built:');
-            console.log('  From:', fromPubkeyString);
-            console.log('  To:', toPubkeyString);
-            console.log('  Lamports:', lamports);
-            console.log('  Blockhash:', blockhash);
-            console.log('  Message length:', messageBytes.length);
-
-            return { transaction, messageBytes, blockhash };
-        } catch (e: any) {
-            console.error('[Solana] Build error:', e);
-            throw new Error(e.message || 'Failed to build transaction');
+    // Get latest blockhash
+    async getLatestBlockhash(): Promise<{ blockhash: string; lastValidBlockHeight: number }> {
+        const resp = await fetch(RPC_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'getLatestBlockhash',
+                params: [{ commitment: 'finalized' }],
+            }),
+        });
+        const data = await resp.json();
+        if (!data.result?.value?.blockhash) {
+            throw new Error('Failed to get blockhash');
         }
+        return {
+            blockhash: data.result.value.blockhash,
+            lastValidBlockHeight: data.result.value.lastValidBlockHeight,
+        };
     }
 
-    // Attach signature to transaction and broadcast
-    async sendSignedTransaction(
-        transaction: Transaction,
-        signatureBase58: string,
-        signerPubkeyString: string
-    ): Promise<string> {
-        try {
-            const signerPubkey = new PublicKey(signerPubkeyString);
-
-            // Decode base58 signature
-            const signatureBytes = base58.decode(signatureBase58);
-
-            if (signatureBytes.length !== 64) {
-                throw new Error(`Invalid signature length: ${signatureBytes.length}, expected 64`);
-            }
-
-            // Add the signature to the transaction
-            transaction.addSignature(signerPubkey, Buffer.from(signatureBytes));
-
-            // Verify the signature is valid
-            if (!transaction.verifySignatures()) {
-                throw new Error('Signature verification failed');
-            }
-
-            // Serialize and send
-            const rawTransaction = transaction.serialize();
-
-            console.log('[Solana] Broadcasting transaction...');
-            const txSignature = await this.connection.sendRawTransaction(rawTransaction, {
-                skipPreflight: false,
-                preflightCommitment: 'confirmed',
-            });
-
-            console.log('[Solana] Transaction sent:', txSignature);
-
-            // Wait for confirmation
-            const confirmation = await this.connection.confirmTransaction(txSignature, 'confirmed');
-
-            if (confirmation.value.err) {
-                throw new Error(`Transaction failed: ${JSON.stringify(confirmation.value.err)}`);
-            }
-
-            console.log('[Solana] Transaction confirmed!');
-            return txSignature;
-        } catch (e: any) {
-            console.error('[Solana] Send error:', e);
-            throw new Error(e.message || 'Failed to send transaction');
+    // Validate Solana address (base58, 32-44 chars)
+    isValidAddress(address: string): boolean {
+        if (!address || address.length < 32 || address.length > 44) {
+            return false;
         }
+        const base58Regex = /^[1-9A-HJ-NP-Za-km-z]+$/;
+        return base58Regex.test(address);
     }
 
-    // Full send flow: build, sign externally, broadcast
-    async prepareTransfer(
-        fromPubkey: string,
-        toPubkey: string,
-        lamports: number
-    ): Promise<{ messageHex: string; transaction: Transaction }> {
-        const { transaction, messageBytes } = await this.buildTransferTransaction(
-            fromPubkey,
-            toPubkey,
-            lamports
+    /**
+     * Build a Solana transfer transaction message
+     * Returns the serialized message bytes for signing
+     */
+    buildTransferMessage(
+        from: string,
+        to: string,
+        lamports: number,
+        blockhash: string
+    ): Uint8Array {
+        const fromPubkey = bs58.decode(from);
+        const toPubkey = bs58.decode(to);
+        const programId = bs58.decode(SYSTEM_PROGRAM_ID);
+        const blockhashBytes = bs58.decode(blockhash);
+
+        // Build the transfer instruction data
+        // SystemProgram::Transfer = instruction index 2
+        // Data: [2 (u32 LE), lamports (u64 LE)]
+        const instructionData = new Uint8Array(12);
+        const view = new DataView(instructionData.buffer);
+        view.setUint32(0, 2, true); // Transfer instruction = 2
+        // Set lamports as little-endian u64
+        view.setBigUint64(4, BigInt(lamports), true);
+
+        // Build the message according to Solana spec:
+        // Header: [num_required_signatures, num_readonly_signed, num_readonly_unsigned]
+        // Account keys: [from, to, system_program]
+        // Recent blockhash
+        // Instructions
+
+        const header = new Uint8Array([1, 0, 1]); // 1 signer, 0 readonly signed, 1 readonly unsigned
+
+        // Compact array encoding for account keys (3 accounts)
+        const numAccounts = 3;
+        const accountKeys = new Uint8Array(1 + 32 * 3);
+        accountKeys[0] = numAccounts;
+        accountKeys.set(fromPubkey, 1);
+        accountKeys.set(toPubkey, 33);
+        accountKeys.set(programId, 65);
+
+        // Instructions compact array (1 instruction)
+        // Instruction format: program_id_index, accounts_length, account_indices..., data_length, data...
+        const instruction = new Uint8Array([
+            1,                      // Number of instructions
+            2,                      // Program ID index (System Program = index 2)
+            2,                      // Number of account indices
+            0, 1,                   // Account indices [from=0, to=1]
+            instructionData.length, // Data length
+            ...instructionData,     // Data
+        ]);
+
+        // Build the full message
+        const message = new Uint8Array(
+            header.length +
+            accountKeys.length +
+            32 + // blockhash
+            instruction.length
         );
 
-        // Convert message bytes to hex for ESP32
-        const messageHex = Buffer.from(messageBytes).toString('hex');
+        let offset = 0;
+        message.set(header, offset);
+        offset += header.length;
+        message.set(accountKeys, offset);
+        offset += accountKeys.length;
+        message.set(blockhashBytes, offset);
+        offset += 32;
+        message.set(instruction, offset);
 
-        return { messageHex, transaction };
+        console.log('[Solana] Built message:', message.length, 'bytes');
+        return message;
     }
 
-    // Get explorer URL for transaction
+    /**
+     * Prepare a transfer for ESP32 signing
+     * Returns the message as hex string for the SIGN command
+     */
+    async prepareTransfer(
+        from: string,
+        to: string,
+        lamports: number
+    ): Promise<{ messageHex: string; blockhash: string; messageBytes: Uint8Array }> {
+        const { blockhash } = await this.getLatestBlockhash();
+
+        const messageBytes = this.buildTransferMessage(from, to, lamports, blockhash);
+        const messageHex = Buffer.from(messageBytes).toString('hex');
+
+        console.log('[Solana] Prepared transfer:');
+        console.log('  From:', from);
+        console.log('  To:', to);
+        console.log('  Amount:', lamports, 'lamports');
+        console.log('  Blockhash:', blockhash);
+        console.log('  Message hex:', messageHex.substring(0, 64) + '...');
+
+        return { messageHex, blockhash, messageBytes };
+    }
+
+    /**
+     * Build and broadcast a signed transaction
+     */
+    async sendSignedTransaction(
+        messageBytes: Uint8Array,
+        signatureHex: string
+    ): Promise<string> {
+        // Convert hex signature to bytes
+        const signature = new Uint8Array(
+            signatureHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16))
+        );
+
+        if (signature.length !== 64) {
+            throw new Error(`Invalid signature length: ${signature.length}, expected 64`);
+        }
+
+        // Build the signed transaction
+        // Format: [signatures_length, signature, message]
+        const signedTx = new Uint8Array(1 + 64 + messageBytes.length);
+        signedTx[0] = 1; // 1 signature
+        signedTx.set(signature, 1);
+        signedTx.set(messageBytes, 65);
+
+        // Encode as base64 for sendTransaction
+        const txBase64 = Buffer.from(signedTx).toString('base64');
+
+        console.log('[Solana] Broadcasting transaction...');
+        console.log('[Solana] Signature:', signatureHex.substring(0, 32) + '...');
+
+        const resp = await fetch(RPC_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'sendTransaction',
+                params: [
+                    txBase64,
+                    {
+                        encoding: 'base64',
+                        skipPreflight: false,
+                        preflightCommitment: 'confirmed',
+                    },
+                ],
+            }),
+        });
+
+        const data = await resp.json();
+
+        if (data.error) {
+            console.error('[Solana] Transaction error:', data.error);
+            throw new Error(data.error.message || 'Transaction failed');
+        }
+
+        const txSignature = data.result;
+        console.log('[Solana] Transaction sent!');
+        console.log('[Solana] Signature:', txSignature);
+
+        return txSignature;
+    }
+
+    /**
+     * Get transaction status
+     */
+    async getTransactionStatus(signature: string): Promise<'confirmed' | 'finalized' | 'failed' | 'pending'> {
+        try {
+            const resp = await fetch(RPC_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    method: 'getSignatureStatuses',
+                    params: [[signature]],
+                }),
+            });
+            const data = await resp.json();
+            const status = data.result?.value?.[0];
+
+            if (!status) return 'pending';
+            if (status.err) return 'failed';
+            if (status.confirmationStatus === 'finalized') return 'finalized';
+            if (status.confirmationStatus === 'confirmed') return 'confirmed';
+            return 'pending';
+        } catch {
+            return 'pending';
+        }
+    }
+
+    /**
+     * Get explorer URL for a transaction
+     */
     getExplorerUrl(signature: string): string {
         return `https://explorer.solana.com/tx/${signature}?cluster=devnet`;
     }
 
-    // Validate Solana address
-    isValidAddress(address: string): boolean {
+    /**
+     * Get recent transaction history for an address
+     */
+    async getTransactionHistory(pubkey: string, limit: number = 10): Promise<Array<{
+        signature: string;
+        slot: number;
+        blockTime: number | null;
+        err: any;
+        type: 'send' | 'receive' | 'unknown';
+        amount: number;
+        otherParty: string;
+    }>> {
         try {
-            new PublicKey(address);
-            return true;
-        } catch {
-            return false;
+            // Get recent signatures
+            const sigResp = await fetch(RPC_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 1,
+                    method: 'getSignaturesForAddress',
+                    params: [pubkey, { limit }],
+                }),
+            });
+            const sigData = await sigResp.json();
+            const signatures = sigData.result || [];
+
+            if (signatures.length === 0) return [];
+
+            // Get transaction details for each signature
+            const txPromises = signatures.slice(0, 5).map(async (sig: any) => {
+                try {
+                    const txResp = await fetch(RPC_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            jsonrpc: '2.0',
+                            id: 1,
+                            method: 'getTransaction',
+                            params: [sig.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }],
+                        }),
+                    });
+                    const txData = await txResp.json();
+                    const tx = txData.result;
+
+                    if (!tx) return null;
+
+                    // Parse transaction
+                    const meta = tx.meta;
+                    const preBalances = meta?.preBalances || [];
+                    const postBalances = meta?.postBalances || [];
+                    const accountKeys = tx.transaction?.message?.accountKeys || [];
+
+                    // Find this wallet's index
+                    const walletIndex = accountKeys.findIndex((key: any) =>
+                        (typeof key === 'string' ? key : key.pubkey) === pubkey
+                    );
+
+                    let type: 'send' | 'receive' | 'unknown' = 'unknown';
+                    let amount = 0;
+                    let otherParty = '';
+
+                    if (walletIndex >= 0 && preBalances[walletIndex] !== undefined) {
+                        const diff = postBalances[walletIndex] - preBalances[walletIndex];
+                        if (diff > 0) {
+                            type = 'receive';
+                            amount = diff;
+                            // Find sender (first signer that's not us)
+                            otherParty = accountKeys[0]?.pubkey || accountKeys[0] || 'Unknown';
+                        } else if (diff < 0) {
+                            type = 'send';
+                            amount = Math.abs(diff);
+                            // Find receiver (second account typically)
+                            otherParty = accountKeys[1]?.pubkey || accountKeys[1] || 'Unknown';
+                        }
+                    }
+
+                    return {
+                        signature: sig.signature,
+                        slot: sig.slot,
+                        blockTime: tx.blockTime,
+                        err: sig.err,
+                        type,
+                        amount,
+                        otherParty: typeof otherParty === 'string' ? otherParty : otherParty || 'Unknown',
+                    };
+                } catch {
+                    return null;
+                }
+            });
+
+            const results = await Promise.all(txPromises);
+            return results.filter((tx): tx is NonNullable<typeof tx> => tx !== null);
+        } catch (e) {
+            console.error('[Solana] Transaction history error:', e);
+            return [];
         }
     }
 }
