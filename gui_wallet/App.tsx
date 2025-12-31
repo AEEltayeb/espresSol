@@ -305,7 +305,7 @@ function ConnectScreen() {
               style={[styles.button, { backgroundColor: '#333', marginTop: 8, paddingVertical: 12 }]}
               onPress={openScanner}
             >
-              <Text style={[styles.buttonText, { fontSize: 14 }]}>📷 Scan QR Code</Text>
+              <Text style={[styles.buttonText, { fontSize: 14 }]}> Scan QR Code</Text>
             </TouchableOpacity>
           </View>
 
@@ -517,10 +517,10 @@ function HomeTab({ setMessage }: { setMessage: (m: string) => void }) {
       setSendAddress('');
       setSendAmount('');
 
-      // Refresh balance after a delay
-      setTimeout(async () => {
-        await refreshBalance();
-      }, 3000);
+      // Refresh balance multiple times to catch confirmation
+      setTimeout(async () => { await refreshBalance(); }, 2000);
+      setTimeout(async () => { await refreshBalance(); }, 5000);
+      setTimeout(async () => { await refreshBalance(); }, 10000);
 
       // Clear message after showing success
       setTimeout(() => {
@@ -604,6 +604,12 @@ function HomeTab({ setMessage }: { setMessage: (m: string) => void }) {
             <Text style={[styles.actionLabel, { color: colors.text }]}>Seed-Phrase</Text>
           </TouchableOpacity>
         </View>
+      </View>
+
+      {/* Engraved Logo Watermark */}
+      <View style={{ alignItems: 'center', marginTop: 40, marginBottom: 20, opacity: 0.15 }}>
+        <EspressoLogo size={100} />
+        <Text style={{ color: colors.primary, fontSize: 24, fontWeight: '700', marginTop: 8, letterSpacing: 2 }}>espresSol</Text>
       </View>
 
       {/* Send Modal */}
@@ -696,14 +702,31 @@ function AnalyticsTab() {
     ? balanceHistory.map(h => Math.max(h.balance / 1e9, 0.0001))
     : [solBalance || 0.0001, solBalance || 0.0001];
 
+  // Format labels to show only time (HH:MM)
   const chartLabels = balanceHistory.length > 0
-    ? balanceHistory.map(h => h.date.slice(5, 10))
+    ? balanceHistory.map(h => {
+      // Extract just the time part (assuming date format includes time)
+      const parts = h.date.split(' ');
+      if (parts.length > 1) {
+        // Get time part and truncate to HH:MM
+        const timePart = parts[parts.length - 1];
+        const timeMatch = timePart.match(/(\d{1,2}:\d{2})/);
+        return timeMatch ? timeMatch[1] : parts[0].slice(-5);
+      }
+      return h.date.slice(-5); // Last 5 chars as fallback
+    })
     : ['Start', 'Now'];
 
   const chartData = {
     labels: chartLabels,
     datasets: [{ data: chartValues, strokeWidth: 2 }],
   };
+
+  // Calculate chart width - min 80px per data point for good spacing
+  const chartWidth = Math.max(
+    Dimensions.get('window').width - 40,
+    chartLabels.length * 80
+  );
 
   // Format time ago
   const timeAgo = (timestamp: number | null) => {
@@ -729,11 +752,11 @@ function AnalyticsTab() {
           <Text style={[styles.statLabel, { color: colors.textMuted }]}>SOL Balance</Text>
         </View>
         <View style={[styles.statCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
-          <Text style={[styles.statValue, { color: colors.text }]}>${balanceUSD.toFixed(2)}</Text>
-          <Text style={[styles.statLabel, { color: colors.textMuted }]}>USD Value</Text>
+          <Text style={[styles.statValue, { color: colors.text }]}>{CURRENCY_SYMBOLS[settings.currency]}{convertCurrency(balanceUSD, settings.currency).toFixed(2)}</Text>
+          <Text style={[styles.statLabel, { color: colors.textMuted }]}>{settings.currency} Value</Text>
         </View>
         <View style={[styles.statCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
-          <Text style={[styles.statValue, { color: colors.text }]}>${solPrice.toFixed(2)}</Text>
+          <Text style={[styles.statValue, { color: colors.text }]}>{CURRENCY_SYMBOLS[settings.currency]}{convertCurrency(solPrice, settings.currency).toFixed(2)}</Text>
           <Text style={[styles.statLabel, { color: colors.textMuted }]}>SOL Price</Text>
         </View>
         <View style={[styles.statCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
@@ -743,29 +766,31 @@ function AnalyticsTab() {
       </View>
 
       <Text style={[styles.chartTitle, { color: colors.textMuted }]}>Balance History (SOL)</Text>
-      <LineChart
-        data={chartData}
-        width={Dimensions.get('window').width - 40}
-        height={180}
-        yAxisSuffix=""
-        yAxisLabel=""
-        chartConfig={{
-          backgroundColor: colors.card,
-          backgroundGradientFrom: colors.card,
-          backgroundGradientTo: colors.bg,
-          decimalPlaces: 2,
-          color: (opacity = 1) => `rgba(139, 92, 246, ${opacity})`,
-          labelColor: () => colors.textMuted,
-          propsForDots: { r: '5', strokeWidth: '2', stroke: colors.primary },
-          propsForBackgroundLines: { strokeDasharray: '', stroke: colors.border },
-          fillShadowGradientFrom: colors.primary,
-          fillShadowGradientTo: 'transparent',
-          fillShadowGradientOpacity: 0.3,
-        }}
-        bezier
-        style={{ ...styles.chart, backgroundColor: colors.card, borderRadius: 16 }}
-        fromZero={true}
-      />
+      <ScrollView horizontal showsHorizontalScrollIndicator={true} style={{ marginHorizontal: -10 }}>
+        <LineChart
+          data={chartData}
+          width={chartWidth}
+          height={180}
+          yAxisSuffix=""
+          yAxisLabel=""
+          chartConfig={{
+            backgroundColor: colors.card,
+            backgroundGradientFrom: colors.card,
+            backgroundGradientTo: colors.bg,
+            decimalPlaces: 2,
+            color: (opacity = 1) => `rgba(139, 92, 246, ${opacity})`,
+            labelColor: () => colors.textMuted,
+            propsForDots: { r: '5', strokeWidth: '2', stroke: colors.primary },
+            propsForBackgroundLines: { strokeDasharray: '', stroke: colors.border },
+            fillShadowGradientFrom: colors.primary,
+            fillShadowGradientTo: 'transparent',
+            fillShadowGradientOpacity: 0.3,
+          }}
+          bezier
+          style={{ ...styles.chart, backgroundColor: colors.card, borderRadius: 16, marginHorizontal: 10 }}
+          fromZero={true}
+        />
+      </ScrollView>
 
       {/* Transactions Section */}
       <Text style={[styles.chartTitle, { marginTop: 24, color: colors.textMuted }]}>Recent Transactions</Text>
@@ -841,9 +866,19 @@ function AnalyticsTab() {
 
                 <View style={{ marginBottom: 16 }}>
                   <Text style={{ color: colors.textMuted, fontSize: 12, marginBottom: 4 }}>Signature</Text>
-                  <TouchableOpacity onPress={() => { Clipboard.setStringAsync(selectedTx.signature); Alert.alert('Copied', 'Signature copied to clipboard'); }}>
+                  <TouchableOpacity onPress={() => {
+                    Alert.alert(
+                      'Transaction Signature',
+                      selectedTx.signature,
+                      [
+                        { text: 'Copy', onPress: () => { Clipboard.setStringAsync(selectedTx.signature); } },
+                        { text: 'View on Explorer', onPress: () => { Linking.openURL(`https://explorer.solana.com/tx/${selectedTx.signature}?cluster=devnet`); } },
+                        { text: 'Cancel', style: 'cancel' }
+                      ]
+                    );
+                  }}>
                     <Text style={{ color: colors.primary, fontSize: 12 }} numberOfLines={2}>{selectedTx.signature}</Text>
-                    <Text style={{ color: colors.textMuted, fontSize: 12 }}>Tap to copy</Text>
+                    <Text style={{ color: colors.textMuted, fontSize: 12 }}>Tap for options</Text>
                   </TouchableOpacity>
                 </View>
               </>
@@ -950,13 +985,25 @@ function SettingsTab({ setMessage }: { setMessage: (m: string) => void }) {
 
   // Factory reset
   const handleFactoryReset = async () => {
-    setMessage('Factory reset initiated on device...');
     setShowReset(false);
+    setMessage('Confirm factory reset on device...');
     try {
-      // TODO: Add FACTORY_RESET command to ESP32
-      setMessage('Factory reset not yet implemented on device');
+      const success = await walletService.factoryReset();
+      if (success) {
+        setMessage('Factory reset complete! Device will restart.');
+        // Disconnect since device is restarting
+        setTimeout(() => {
+          disconnect();
+        }, 2000);
+      } else {
+        setMessage('Factory reset cancelled or failed');
+      }
     } catch (e: any) {
-      setMessage('Error: ' + e.message);
+      if (e.message?.includes('timeout')) {
+        setMessage('Cancelled on device');
+      } else {
+        setMessage('Error: ' + e.message);
+      }
     }
   };
 
@@ -1018,21 +1065,6 @@ function SettingsTab({ setMessage }: { setMessage: (m: string) => void }) {
         <View style={[styles.settingRow, { borderBottomColor: colors.border + '50' }]}>
           <Text style={[styles.settingLabel, { color: colors.text }]}>Device IP</Text>
           <Text style={[styles.settingValue, { color: colors.textMuted }]}>{deviceIP || 'Not connected'}</Text>
-        </View>
-
-        <View style={[styles.settingRow, { borderBottomColor: colors.border + '50' }]}>
-          <Text style={[styles.settingLabel, { color: colors.text }]}>Timeout: {settings.connectionTimeout}s</Text>
-          <View style={styles.sliderRow}>
-            <TouchableOpacity style={[styles.sliderBtn, { backgroundColor: colors.border }]} onPress={() => settings.setConnectionTimeout(Math.max(10, settings.connectionTimeout - 10))}>
-              <Text style={[styles.sliderBtnText, { color: colors.text }]}>−</Text>
-            </TouchableOpacity>
-            <View style={[styles.sliderTrack, { backgroundColor: colors.border }]}>
-              <View style={[styles.sliderFill, { width: `${((settings.connectionTimeout - 10) / 50) * 100}%` }]} />
-            </View>
-            <TouchableOpacity style={[styles.sliderBtn, { backgroundColor: colors.border }]} onPress={() => settings.setConnectionTimeout(Math.min(60, settings.connectionTimeout + 10))}>
-              <Text style={[styles.sliderBtnText, { color: colors.text }]}>+</Text>
-            </TouchableOpacity>
-          </View>
         </View>
       </View>
 

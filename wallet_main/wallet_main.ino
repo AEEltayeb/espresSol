@@ -12,6 +12,7 @@
 #include "transaction_handler.h"
 #include "crypto/ed25519.h"
 #include "crypto/mnemonic.h"
+#include "menu_system.h"
 
 // WebSocket server for mobile app connectivity
 #define USE_WEBSOCKET_SERVER 1
@@ -54,15 +55,15 @@ flflflflflflflflflflflflflflflflflflflflflflflflflflflflflflfl
 const uint16_t SERVER_PORT = 8443;
 
 // ===== HARDWARE PINS =====
-// Your button wiring:
-// - White button (GPIO 4)  = OK/Confirm
-// - Red button (GPIO 23)   = Reject/Cancel  
-// - Blue button 1 (GPIO 19) = UP scroll
-// - Blue button 2 (GPIO 18) = DOWN scroll
-const int BTN_OK = 4;      // White button - approve/confirm
-const int BTN_DOWN = 23;   // Red button - decrement/reject
-const int BTN_UP = 19;     // Blue button 1 - increment/scroll
-const int BTN_BACK = 18;   // Blue button 2 - back/cancel
+// Your button wiring (Remapped):
+// - Confirm (OK)     = GPIO 15
+// - Blue Button 1 (UP)   = GPIO 5
+// - Blue Button 2 (DOWN) = GPIO 23
+// - Reject (BACK)    = GPIO 18
+const int BTN_OK = 15;     // Confirm
+const int BTN_UP = 5;      // Blue 1
+const int BTN_DOWN = 23;   // Blue 2 (User requested 23)
+const int BTN_BACK = 18;   // Reject (Between 5 and 23)
 
 // ===== TLS CONFIGURATION =====
 #define USE_TLS_SERVER 1  // Set to 1 to enable TLS, 0 for plain TCP
@@ -115,6 +116,9 @@ const unsigned long SESSION_TIMEOUT = 300000;  // 5 minutes auto-lock
 // ===== QR CODE DISPLAY TOGGLE =====
 bool showQRCode = true;  // Toggle between QR code and text IP display
 unsigned long lastDisplayToggle = 0;  // Debounce button
+
+// ===== CONNECTION MODE =====
+bool usbModeActive = false;  // True when in USB mode (prevents WiFi code from running)
 
 // ===== WEBSOCKET SERVER (for mobile app) =====
 #if USE_WEBSOCKET_SERVER
@@ -973,6 +977,16 @@ void connectWiFi() {
 
 // ===== MNEMONIC DISPLAY =====
 void displayMnemonic() {
+  // Debug: Print all words to serial
+  Serial.println("[MNEMONIC] Displaying mnemonic words:");
+  for (int i = 0; i < 12; i++) {
+    Serial.print("[MNEMONIC] Word ");
+    Serial.print(i + 1);
+    Serial.print(": '");
+    Serial.print(mnemonicWords[i]);
+    Serial.println("'");
+  }
+  
   drawCentered("BACKUP PHRASE", -20);
   drawCentered("Write these down!", 0);
   delay(3000);
@@ -1305,8 +1319,58 @@ void setup() {
   
   // Initialize display
   u8g2.begin();
-  drawCentered("Booting...", 0);
-  delay(500);
+  
+  // Check for emergency factory reset (hold OK + BACK during boot)
+  if (digitalRead(BTN_OK) == LOW && digitalRead(BTN_BACK) == LOW) {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_9x15B_tf);
+    u8g2.drawStr(5, 15, "EMERGENCY");
+    u8g2.drawStr(5, 32, "FACTORY RESET");
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 48, "Hold 3 sec to confirm");
+    u8g2.drawStr(0, 60, "Release to cancel");
+    u8g2.sendBuffer();
+    
+    // Wait 3 seconds while both buttons held
+    unsigned long start = millis();
+    while (digitalRead(BTN_OK) == LOW && digitalRead(BTN_BACK) == LOW) {
+      if (millis() - start > 3000) {
+        // Perform emergency wipe
+        u8g2.clearBuffer();
+        u8g2.setFont(u8g2_font_9x15B_tf);
+        u8g2.drawStr(20, 35, "WIPING...");
+        u8g2.sendBuffer();
+        
+        Preferences wipePrefs;
+        wipePrefs.begin("wallet", false);
+        wipePrefs.clear();
+        wipePrefs.end();
+        
+        wipePrefs.begin("wifi", false);
+        wipePrefs.clear();
+        wipePrefs.end();
+        
+        delay(1000);
+        u8g2.clearBuffer();
+        u8g2.drawStr(15, 30, "WIPED!");
+        u8g2.setFont(u8g2_font_6x10_tf);
+        u8g2.drawStr(10, 50, "Restarting...");
+        u8g2.sendBuffer();
+        delay(2000);
+        ESP.restart();
+      }
+      delay(100);
+    }
+    // Buttons released before 3 sec - cancelled
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_9x15_tf);
+    u8g2.drawStr(15, 35, "Cancelled");
+    u8g2.sendBuffer();
+    delay(1000);
+  }
+  
+  // Show splash screen with logo
+  showSplashScreen(2000);  // Display for 2 seconds
   
   // Load wallet keys with PIN protection
   prefs.begin("wallet", false);
@@ -1467,25 +1531,47 @@ void setup() {
         prefs.putInt("pin_fails", 0);
         
         // Load mnemonic (encrypted in newer versions)
+        Serial.println("[MNEM_LOAD] Checking for encrypted mnemonic...");
+        Serial.print("[MNEM_LOAD] enc_mnem exists: "); Serial.println(prefs.isKey("enc_mnem") ? "YES" : "NO");
+        Serial.print("[MNEM_LOAD] mnemonic exists: "); Serial.println(prefs.isKey("mnemonic") ? "YES" : "NO");
+        
         if (prefs.isKey("enc_mnem")) {
           // Decrypt mnemonic
           int mnem_len = prefs.getInt("mnem_len", 0);
+          Serial.print("[MNEM_LOAD] mnem_len: "); Serial.println(mnem_len);
+          
+          // Debug: print pin_key being used
+          Serial.print("[MNEM_LOAD] pin_key (first 4 bytes): ");
+          for (int i = 0; i < 4; i++) Serial.printf("%02X", pin_key[i]);
+          Serial.println();
+          
           uint8_t mnem_ct[256], mnem_iv[12], mnem_tag[16];
           prefs.getBytes("enc_mnem", mnem_ct, mnem_len);
           prefs.getBytes("mnem_iv", mnem_iv, 12);
           prefs.getBytes("mnem_tag", mnem_tag, 16);
           
+          // Debug: print IV and tag
+          Serial.print("[MNEM_LOAD] mnem_iv: ");
+          for (int i = 0; i < 12; i++) Serial.printf("%02X", mnem_iv[i]);
+          Serial.println();
+          Serial.print("[MNEM_LOAD] mnem_tag: ");
+          for (int i = 0; i < 16; i++) Serial.printf("%02X", mnem_tag[i]);
+          Serial.println();
+          
           uint8_t decrypted[256];
           mbedtls_gcm_context gcm;
           mbedtls_gcm_init(&gcm);
           mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, pin_key, 128);
-          mbedtls_gcm_auth_decrypt(&gcm, mnem_len, mnem_iv, 12,
+          int ret = mbedtls_gcm_auth_decrypt(&gcm, mnem_len, mnem_iv, 12,
                                     NULL, 0, mnem_tag, 16,
                                     mnem_ct, decrypted);
           mbedtls_gcm_free(&gcm);
           
+          Serial.print("[MNEM_LOAD] Decrypt result: "); Serial.println(ret);
+          
           decrypted[mnem_len] = '\0';
           String mnemonicStr = String((char*)decrypted);
+          Serial.print("[MNEM_LOAD] Decrypted string: '"); Serial.print(mnemonicStr); Serial.println("'");
           
           int wordIndex = 0;
           int start = 0;
@@ -1535,93 +1621,46 @@ void setup() {
   drawCentered("Unlocked!", 0);
   delay(1000);
   
-  // Mode selection using buttons and display
-  drawCentered("Select Mode:", -20);
-  drawCentered("UP=WiFi", 0);
-  drawCentered("DOWN=USB", 20);
-  
-  // Wait for button press
-  bool modeSelected = false;
-  bool useUSB = false;
-  
-  while (!modeSelected) {
-    if (digitalRead(BTN_UP) == LOW) {
-      // WiFi mode selected
-      useUSB = false;
-      modeSelected = true;
-      delay(200); // Debounce
-    }
-    else if (digitalRead(BTN_DOWN) == LOW) {
-      // USB mode selected
-      useUSB = true;
-      modeSelected = true;
-      delay(200); // Debounce
-    }
-    delay(50);
-  }
-  
-  if (useUSB) {
-    // USB mode - wait for PC connection
-    Serial.println("[USB] USB mode selected - waiting for PC...");
-    drawCentered("USB Mode", -10);
-    drawCentered("Connect PC now", 10);
-    delay(1000);
-    sendUSBReady();  // Start USB pairing
-    handleUSBPairing();
-  } else {
-    // WiFi mode
-    Serial.println("[WiFi] WiFi mode selected");
-    drawCentered("WiFi Mode", 0);
-    delay(500);
-    connectWiFi();
-#if USE_TLS_SERVER
-    if (tlsServer.begin(SERVER_PORT)) {
-      Serial.println("[TLS] TLS server started!");
-    } else {
-      Serial.println("[TLS] Failed to start TLS server!");
-    }
-#else
-    wifiServer.begin();
-#endif
-    Serial.print("[Server] Listening on port "); Serial.println(SERVER_PORT);
-    
-#if USE_WEBSOCKET_SERVER
-    // Start WebSocket server for mobile app
-    wsServer.begin();
-    wsServer.onEvent(wsEvent);
-    Serial.println("[WS] WebSocket server started on port 8444");
-#endif
-    
-    String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
-    Serial.print("[WiFi] Pairing QR: "); Serial.println(ipMsg);
-    
-    // Display QR code for mobile app pairing
-    displayIPQRCode(ipMsg);
-  }
+  // Show main menu - user chooses WiFi or USB mode from menu
+  // NO automatic WiFi connection!
+  Serial.println("[Menu] Showing main menu");
+  currentMenu = MENU_MAIN;
+  menuSelection = 0;
+  menuScrollOffset = 0;
+  showMainMenu();
 }
 
 void loop() {
   // Check for USB serial commands
   handleSerialCommand();
   
-  // Handle WiFi clients (only if WiFi is connected)
-  if (WiFi.status() == WL_CONNECTED) {
-    // Toggle QR/text display with OK button (when no client connected)
-    if (digitalRead(BTN_OK) == LOW && millis() - lastDisplayToggle > 500) {
-      lastDisplayToggle = millis();
-      showQRCode = !showQRCode;
-      String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
-      if (showQRCode) {
-        displayIPQRCode(ipMsg);
-        Serial.println("[Display] Showing QR code");
-      } else {
-        u8g2.clearBuffer();
-        u8g2.setFont(u8g2_font_9x15_tf);
-        drawCentered("WiFi Ready", -10);
-        drawCentered(ipMsg.c_str(), 10);
-        Serial.println("[Display] Showing text IP");
+  // Update menu system (processes button input when menu is active)
+  updateMenu();
+  
+  // Handle WiFi clients (only if WiFi is connected AND not in USB mode)
+  if (WiFi.status() == WL_CONNECTED && !usbModeActive) {
+    // When menu is NOT active, handle idle screen buttons
+    if (!isMenuActive()) {
+      // BTN_BACK enters menu
+      // (handled by updateMenu() -> handleMenuInput())
+      
+      // BTN_OK toggles QR/text display
+      if (digitalRead(BTN_OK) == LOW && millis() - lastDisplayToggle > 500) {
+        lastDisplayToggle = millis();
+        showQRCode = !showQRCode;
+        String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
+        if (showQRCode) {
+          displayIPQRCode(ipMsg);
+          Serial.println("[Display] Showing QR code");
+        } else {
+          u8g2.clearBuffer();
+          u8g2.setFont(u8g2_font_9x15_tf);
+          drawCentered("WiFi Ready", -10);
+          drawCentered(ipMsg.c_str(), 10);
+          Serial.println("[Display] Showing text IP");
+        }
+        delay(200);  // Extra debounce
       }
-      delay(200);  // Extra debounce
     }
     
 #if USE_TLS_SERVER
@@ -2065,6 +2104,65 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
       }
     } else {
       wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"missing_words\"}");
+    }
+  }
+  // FACTORY_RESET
+  else if (strcmp(cmd, "FACTORY_RESET") == 0) {
+    if (!pin_verified) {
+      wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"device_locked\"}");
+      return;
+    }
+    
+    // Show confirmation screen on OLED
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_9x15_tf);
+    u8g2.drawStr(0, 12, "!! FACTORY RESET !!");
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 28, "This will ERASE all");
+    u8g2.drawStr(0, 40, "keys, WiFi & settings");
+    u8g2.setFont(u8g2_font_9x15_tf);
+    u8g2.drawStr(0, 58, "OK=WIPE  X=Cancel");
+    u8g2.sendBuffer();
+    
+    // Wait for physical button confirmation
+    int decision = waitForDecision();
+    
+    if (decision == 1) {
+      // User confirmed - wipe everything
+      drawCentered("Wiping...", 0);
+      
+      // Clear wallet namespace
+      prefs.end();
+      prefs.begin("wallet", false);
+      prefs.clear();
+      prefs.end();
+      
+      // Clear WiFi namespace
+      Preferences wifiPrefs;
+      wifiPrefs.begin("wifi", false);
+      wifiPrefs.clear();
+      wifiPrefs.end();
+      
+      // Clear any other namespaces
+      Preferences miscPrefs;
+      miscPrefs.begin("settings", false);
+      miscPrefs.clear();
+      miscPrefs.end();
+      
+      wsServer.sendTXT(num, "{\"ok\":true,\"message\":\"factory_reset_complete\"}");
+      
+      drawCentered("Reset Complete!", -10);
+      drawCentered("Restarting...", 10);
+      delay(2000);
+      ESP.restart();
+    } else {
+      // User cancelled
+      wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"cancelled\"}");
+      drawCentered("Cancelled", 0);
+      delay(1000);
+      String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
+      drawCentered("TLS+WS Ready", -10);
+      drawCentered(ipMsg.c_str(), 10);
     }
   }
   // Unknown

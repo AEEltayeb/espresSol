@@ -60,6 +60,17 @@ export const useWalletStore = create<WalletState>((set, get) => ({
             // Save IP for next time
             await get().saveIP(ip);
 
+            // Load saved balance history
+            try {
+                const savedHistory = await AsyncStorage.getItem('balance_history');
+                if (savedHistory) {
+                    const history = JSON.parse(savedHistory);
+                    set({ balanceHistory: history });
+                }
+            } catch (e) {
+                console.log('No saved history');
+            }
+
             // Fetch balance
             await get().refreshBalance();
 
@@ -123,11 +134,27 @@ export const useWalletStore = create<WalletState>((set, get) => ({
                 set({ balance: lamports });
             }
 
-            // Add to history
+            // Add to history only if balance changed
             const history = get().balanceHistory;
-            const today = new Date().toISOString().split('T')[0];
-            const newHistory = [...history.filter(h => h.date !== today), { date: today, balance: lamports }];
-            set({ balanceHistory: newHistory.slice(-7) }); // Keep last 7 days
+            const lastBalance = history.length > 0 ? history[history.length - 1].balance : null;
+
+            // Only add new entry if balance is different from last recorded
+            if (lamports !== lastBalance) {
+                const now = new Date();
+                const hours = now.getHours().toString().padStart(2, '0');
+                const mins = now.getMinutes().toString().padStart(2, '0');
+                const label = `${hours}:${mins}`;
+
+                const newHistory = [...history, { date: label, balance: lamports }]
+                    .slice(-20); // Keep last 20 balance changes
+                set({ balanceHistory: newHistory });
+
+                try {
+                    await AsyncStorage.setItem('balance_history', JSON.stringify(newHistory));
+                } catch (e) {
+                    console.error('Failed to save history:', e);
+                }
+            }
 
         } catch (e) {
             console.error('Failed to fetch balance:', e);

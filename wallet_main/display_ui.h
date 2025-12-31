@@ -6,6 +6,61 @@ extern U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2;
 extern const int BTN_OK;
 extern const int BTN_DOWN;
 
+// Display splash screen with logo matching mobile app
+inline void showSplashScreen(int durationMs = 2000) {
+  u8g2.clearBuffer();
+  
+  // Logo based on mobile app SVG (scaled for 128x64 OLED)
+  // Original viewBox: 0 0 512 512, scale factor ~0.1
+  int ox = 20;  // x offset to center logo on left side
+  int oy = -2;  // y offset
+  
+  // Steam lines (2 wavy curves above cup)
+  // Steam 1: M270 20 -> curves up
+  u8g2.drawLine(ox + 27, oy + 2, ox + 26, oy + 5);
+  u8g2.drawLine(ox + 26, oy + 5, ox + 28, oy + 8);
+  u8g2.drawLine(ox + 28, oy + 8, ox + 27, oy + 11);
+  
+  // Steam 2: M230 40 -> curves up  
+  u8g2.drawLine(ox + 23, oy + 4, ox + 22, oy + 7);
+  u8g2.drawLine(ox + 22, oy + 7, ox + 24, oy + 10);
+  u8g2.drawLine(ox + 24, oy + 10, ox + 23, oy + 13);
+  
+  // Cup body (rectangle with rounded bottom)
+  // M160 210 L352 210 -> top edge at y=21
+  u8g2.drawHLine(ox + 16, oy + 21, 20);  // Top rim
+  // Sides and rounded bottom
+  u8g2.drawVLine(ox + 16, oy + 21, 15);  // Left side
+  u8g2.drawVLine(ox + 35, oy + 21, 15);  // Right side
+  // Bottom curve
+  u8g2.drawLine(ox + 16, oy + 36, ox + 20, oy + 40);
+  u8g2.drawHLine(ox + 20, oy + 40, 12);
+  u8g2.drawLine(ox + 32, oy + 40, ox + 35, oy + 36);
+  
+  // Handle (arc on right side)
+  // M352 240 C400 240 420 260 420 290 C420 320 400 340 352 340
+  u8g2.drawCircle(ox + 40, oy + 29, 6, U8G2_DRAW_UPPER_RIGHT | U8G2_DRAW_LOWER_RIGHT);
+  
+  // Saucer (curved line below cup)
+  // M120 410 Q256 470 392 410
+  u8g2.drawLine(ox + 10, oy + 44, ox + 18, oy + 48);
+  u8g2.drawHLine(ox + 18, oy + 48, 16);
+  u8g2.drawLine(ox + 34, oy + 48, ox + 42, oy + 44);
+  
+  // Shadow curve (lighter, smaller arc below saucer)
+  u8g2.drawLine(ox + 14, oy + 50, ox + 20, oy + 52);
+  u8g2.drawHLine(ox + 20, oy + 52, 12);
+  u8g2.drawLine(ox + 32, oy + 52, ox + 38, oy + 50);
+  
+  // Brand name "espresSol" on right side
+  u8g2.setFont(u8g2_font_9x15B_tf);
+  u8g2.drawStr(58, 35, "espres");
+  u8g2.drawStr(58, 52, "Sol");
+  
+  u8g2.sendBuffer();
+  delay(durationMs);
+}
+
 // Display a QR code on the OLED (version 3 = 29x29 modules)
 inline void drawQRCode(const char* data) {
   QRCode qrcode;

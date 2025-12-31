@@ -53,20 +53,21 @@ inline void generateMnemonic(const uint8_t entropy[12], String words[12]) {
   uint8_t checksum = hash[0];
   
   // First 11 words from entropy, 12th word is checksum
+  // On ESP32, PROGMEM is directly accessible (no pgm_read needed)
   for (int i = 0; i < 11; i++) {
-    words[i] = String((const char*)pgm_read_ptr(&MNEMONIC_WORDS[entropy[i]]));
+    words[i] = String(MNEMONIC_WORDS[entropy[i]]);
   }
-  words[11] = String((const char*)pgm_read_ptr(&MNEMONIC_WORDS[checksum]));
+  words[11] = String(MNEMONIC_WORDS[checksum]);
 }
 
 // Convert mnemonic back to entropy and verify checksum
 inline bool mnemonicToEntropy(const String words[12], uint8_t entropy[12]) {
   // Find word indices
+  // On ESP32, PROGMEM is directly accessible (no pgm_read needed)
   for (int i = 0; i < 12; i++) {
     bool found = false;
     for (int j = 0; j < 256; j++) {
-      const char* word = (const char*)pgm_read_ptr(&MNEMONIC_WORDS[j]);
-      if (words[i].equals(word)) {
+      if (words[i].equals(MNEMONIC_WORDS[j])) {
         entropy[i] = j;
         found = true;
         break;
