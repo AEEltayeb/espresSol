@@ -6,6 +6,7 @@
  */
 
 import { secureChannel, SecureChannel } from './SecureChannel';
+import { Alert } from 'react-native';
 
 export interface WalletResponse {
   ok: boolean;
@@ -67,21 +68,52 @@ class WalletService {
           try {
             // Check if this is the KEY_EXCHANGE response
             if (!this.secureChannelEstablished) {
-              const data: WalletResponse = JSON.parse(event.data);
+              const data: WalletResponse & { status?: string; code?: string } = JSON.parse(event.data);
 
-              if (data.ecdh_pub && data.salt) {
-                console.log('[WS] Received KEY_EXCHANGE response');
+              // Step 1: Pending response with pairing code (user must approve on device)
+              if (data.status === 'pending' && data.ecdh_pub && data.salt) {
+                console.log('[WS] Received pairing code, waiting for device approval...');
 
+                // Complete key exchange to derive same pairing code
                 if (secureChannel.completeKeyExchange(data.ecdh_pub, data.salt)) {
-                  this.secureChannelEstablished = true;
-                  console.log('[WS] Secure channel established!');
-                  resolve(true);
+                  const pairingCode = secureChannel.getPairingCode();
+                  console.log('[WS] Pairing code: ' + pairingCode);
+
+                  // Show code to user while they verify on device
+                  Alert.alert(
+                    'Verify Pairing Code',
+                    `Code: ${pairingCode || data.code}\n\nConfirm this matches the code on your device, then press OK on the device.`,
+                    [{ text: 'OK', style: 'default' }]
+                  );
                 } else {
-                  reject(new Error('Key exchange failed'));
+                  reject(new Error('Key derivation failed'));
                 }
+                // Don't resolve yet - wait for confirmed response
                 return;
-              } else if (data.error) {
-                reject(new Error(data.error));
+              }
+
+              // Step 2: Confirmed response (user approved on device)
+              if (data.ok === true && data.ecdh_pub && data.salt) {
+                console.log('[WS] Device approved connection!');
+
+                // If we haven't completed key exchange yet (shouldn't happen)
+                if (!secureChannel.isReady()) {
+                  secureChannel.completeKeyExchange(data.ecdh_pub, data.salt);
+                }
+
+                this.secureChannelEstablished = true;
+                console.log('[WS] Secure channel established!');
+                resolve(true);
+                return;
+              }
+
+              // Error response
+              if (data.error) {
+                if (data.error === 'user_denied') {
+                  reject(new Error('Connection denied by user on device'));
+                } else {
+                  reject(new Error(data.error));
+                }
                 return;
               }
             }

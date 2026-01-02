@@ -122,21 +122,56 @@ def show_mnemonic(ch: SecureChannel):
 
 
 def recover_wallet(ch: SecureChannel):
-    """Recover wallet from 12-word mnemonic."""
+    """Recover wallet from 12-word BIP39 mnemonic with device code verification."""
     print("\n=== Wallet Recovery ===")
-    print("Enter your 12-word backup phrase:")
+    print("[!] SECURITY: This uses 2-step verification")
+    print("    1. Device shows 6-digit code")
+    print("    2. You enter code here to prove physical access\n")
+    
+    # Step 1: Request device to display recovery code
+    print("[*] Step 1: Requesting recovery code from device...")
+    ch.send_json({"cmd": "RECOVERY_INIT"})
+    resp = ch.recv_json(timeout=10)
+    
+    if not resp.get("ok"):
+        error = resp.get("error", "unknown")
+        if error == "device_locked":
+            print("[!] Device is locked. Enter PIN on device first.")
+        else:
+            print(f"[!] Failed to init recovery: {error}")
+        return False
+    
+    print("[✓] Recovery code is now displayed on device screen!")
+    print("[!] Look at your hardware wallet and enter the 6-digit code:\n")
+    
+    # Step 2: Get device code from user
+    device_code = input("Enter 6-digit code from device: ").strip()
+    try:
+        device_code = int(device_code)
+        if device_code < 0 or device_code > 999999:
+            raise ValueError()
+    except ValueError:
+        print("[!] Invalid code format. Must be 6 digits.")
+        return False
+    
+    # Step 3: Get mnemonic words
+    print("\n[*] Step 2: Enter your 12-word BIP39 backup phrase:")
     words = []
     for i in range(12):
         word = input(f"Word {i+1}: ").strip().lower()
+        if not word:
+            print("[!] Word cannot be empty")
+            return False
         words.append(word)
     
+    # Step 4: Send recovery request with code
     print("\n[*] Sending recovery request...")
-    cmd = {"cmd": "RECOVER"}
+    cmd = {"cmd": "RECOVER", "device_code": device_code}
     for i, word in enumerate(words):
         cmd[f"word{i}"] = word
     
     ch.send_json(cmd)
-    resp = ch.recv_json(timeout=10)
+    resp = ch.recv_json(timeout=30)  # May take time for BIP39 derivation
     
     if resp.get("ok"):
         print("[✓] Wallet recovered successfully!")
@@ -144,13 +179,22 @@ def recover_wallet(ch: SecureChannel):
         return True
     else:
         error = resp.get("error", "unknown")
-        print(f"[!] Recovery failed: {error}")
+        if error == "invalid_code":
+            print("[!] Wrong device code! Recovery cancelled.")
+        elif error == "no_recovery_code":
+            print("[!] Recovery code expired. Try again from the beginning.")
+        elif error == "invalid_mnemonic":
+            print("[!] Invalid BIP39 mnemonic. Check your words.")
+        else:
+            print(f"[!] Recovery failed: {error}")
         return False
 
 
 def set_wifi(ch: SecureChannel):
-    """Configure WiFi credentials on ESP32."""
+    """Configure WiFi credentials on ESP32 with physical confirmation."""
     print("\n=== WiFi Configuration ===")
+    print("[!] SECURITY: Requires physical button confirmation on device\n")
+    
     ssid = input("WiFi SSID: ").strip()
     password = input("WiFi Password: ").strip()
     
@@ -158,17 +202,30 @@ def set_wifi(ch: SecureChannel):
         print("[!] SSID cannot be empty")
         return False
     
-    print("\n[*] Updating WiFi credentials...")
+    print("\n[*] Sending WiFi credentials...")
+    print("[!] Look at device screen and press OK to confirm, or BACK to cancel")
+    print("[*] Waiting up to 60 seconds for confirmation...\n")
+    
     ch.send_json({"cmd": "SET_WIFI", "ssid": ssid, "password": password})
-    resp = ch.recv_json(timeout=10)
+    
+    try:
+        resp = ch.recv_json(timeout=60)  # 60 second timeout for user confirmation
+    except TimeoutError:
+        print("[!] Timeout waiting for device confirmation")
+        return False
     
     if resp.get("ok"):
-        print("[✓] WiFi credentials updated!")
-        print("[*] ESP32 will use new credentials on next restart")
+        print("[✓] WiFi credentials saved!")
+        print("[*] ESP32 will restart with new WiFi...")
         return True
     else:
         error = resp.get("error", "unknown")
-        print(f"[!] Update failed: {error}")
+        if error == "user_cancelled":
+            print("[!] WiFi update cancelled by user on device")
+        elif error == "device_locked":
+            print("[!] Device is locked. Enter PIN on device first.")
+        else:
+            print(f"[!] Update failed: {error}")
         return False
 
 

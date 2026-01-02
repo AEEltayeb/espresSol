@@ -20,6 +20,7 @@ export class SecureChannel {
     private publicKey: Uint8Array | null = null;
     private txCounter: number = 1;
     private ready: boolean = false;
+    private pairingCode: number | null = null;
 
     /**
      * Generate our keypair for ECDH
@@ -64,6 +65,10 @@ export class SecureChannel {
             const hash = sha256(keyMaterial);
             this.sharedKey = hash.slice(0, 16); // First 16 bytes as AES-128 key
 
+            // Calculate pairing code from hash (bytes 16-18) - same algorithm as ESP32
+            // pairingCode = (hash[16] << 16 | hash[17] << 8 | hash[18]) % 1000000
+            this.pairingCode = ((hash[16] << 16) | (hash[17] << 8) | hash[18]) % 1000000;
+
             this.txCounter = 1;
             this.ready = true;
 
@@ -73,6 +78,14 @@ export class SecureChannel {
             console.error('[SecureChannel] Key exchange failed:', e);
             return false;
         }
+    }
+
+    /**
+     * Get the 6-digit pairing code for user verification
+     */
+    getPairingCode(): string | null {
+        if (this.pairingCode === null) return null;
+        return this.pairingCode.toString().padStart(6, '0');
     }
 
     /**
@@ -137,13 +150,14 @@ export class SecureChannel {
     }
 
     /**
-     * Reset the channel (for reconnection)
+     * Reset the channel (disconnect)
      */
     reset(): void {
         this.sharedKey = null;
         this.salt = null;
         this.privateKey = null;
         this.publicKey = null;
+        this.pairingCode = null;
         this.txCounter = 1;
         this.ready = false;
     }

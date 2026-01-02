@@ -15,7 +15,9 @@
 #include <esp_random.h>
 #include <WebSocketsServer.h>
 #include "mbedtls/gcm.h"
+#if USE_TLS_SERVER
 #include "tls_server.h"
+#endif
 
 // External references
 extern U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2;
@@ -23,10 +25,11 @@ extern const int BTN_UP;
 extern const int BTN_DOWN;
 extern const int BTN_OK;
 extern const int BTN_BACK;
+extern const uint16_t SERVER_PORT;
 extern uint8_t ed25519_pk[32];
 extern String mnemonicWords[12];
 extern bool pin_verified;
-extern unsigned long last_activity_time;
+extern unsigned long lastActivityTime;
 extern String bytesToBase58(const uint8_t* data, size_t len);
 
 // Forward declarations for actions
@@ -318,11 +321,7 @@ inline void handleMenuInput() {
           extern void connectWiFi();
           connectWiFi();
           
-          // Start TLS server
-          extern TLSServer tlsServer;
-          extern const uint16_t SERVER_PORT;
-          tlsServer.begin(SERVER_PORT);
-          Serial.println("[TLS] TLS server started");
+          // TLS server is started in connectWiFi() after cert init
           
           // Start WebSocket server
           extern WebSocketsServer wsServer;

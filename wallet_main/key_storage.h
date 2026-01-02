@@ -50,11 +50,22 @@ inline bool generateAndStoreEncryptedKey(Preferences& prefs, const uint8_t pinKe
                                           const uint8_t salt[16],
                                           uint8_t sk[32], uint8_t pk[32], 
                                           String mnemonic[12]) {
-  // Generate entropy and mnemonic
-  uint8_t entropy[12];
-  esp_fill_random(entropy, 12);
+  // Generate 128-bit entropy for BIP39 (16 bytes)
+  uint8_t entropy[16];
+  esp_fill_random(entropy, 16);
+  
+  // Generate BIP39 mnemonic
   generateMnemonic(entropy, mnemonic);
-  entropyToKey(entropy, sk);
+  
+  // Derive key using BIP39 + SLIP-0010 (Solana path m/44'/501'/0'/0')
+  uint8_t bip39Seed[64];
+  if (tryRecoverBIP39(mnemonic, bip39Seed)) {
+    bip39ToKey(bip39Seed, sk);
+  } else {
+    // Fallback - shouldn't happen with freshly generated BIP39 mnemonic
+    return false;
+  }
+  
   ed25519_publickey(sk, pk);
   
   // Encrypt private key
@@ -244,17 +255,17 @@ inline bool loadOrGenerateKey(Preferences& prefs, uint8_t sk[32], uint8_t pk[32]
   return false;
 }
 
-// Recover wallet from mnemonic phrase
+// Recover wallet from mnemonic phrase (using BIP39)
 inline bool recoverFromMnemonic(Preferences& prefs, String words[12], 
                                  uint8_t sk[32], uint8_t pk[32]) {
-  // Validate and convert mnemonic to entropy
-  uint8_t entropy[12];
-  if (!mnemonicToEntropy(words, entropy)) {
+  // Use BIP39 recovery
+  uint8_t seed[64];
+  if (!recoverBIP39(words, seed)) {
     return false;  // Invalid mnemonic
   }
   
-  // Derive key from entropy
-  entropyToKey(entropy, sk);
+  // Derive key using SLIP-0010
+  bip39ToKey(seed, sk);
   ed25519_publickey(sk, pk);
   
   // Store as plain key (will be encrypted on next boot with PIN migration)

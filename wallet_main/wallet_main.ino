@@ -12,6 +12,7 @@
 #include "transaction_handler.h"
 #include "crypto/ed25519.h"
 #include "crypto/mnemonic.h"
+#include "security_hardening.h"
 #include "menu_system.h"
 
 // WebSocket server for mobile app connectivity
@@ -20,56 +21,26 @@
 #include <WebSocketsServer.h>
 #endif
 
-// ===== TLS CERTIFICATE (Self-signed) =====
-// Valid for: ESP32 Hardware Wallet
-// Run: openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 3650
-const char* server_cert = R"CERT(
------BEGIN CERTIFICATE-----
-MIIDCTCCAfGgAwIBAgIUQmVKk9HhB6yD7KGS0g8fF7pG9sgwDQYJKoZIhvcNAQEL
-BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI0MDEwMTAwMDAwMFoXDTM0MDEw
-MTAwMDAwMFowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
-AAOCAQ8AMIIBCgKCAQEAx0G5E3jfv9R7q2XPJ8w6xG5eQfR6vC5HdA5VG8R1mVk8
-YX7eHb1cA5U5H1X5V5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5
-X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5
-X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5X5
-wIDAQABo1MwUTAdBgNVHQ4EFgQU1234567890abcdefghijklmnopqrst0wHwYDVR
-0jBBgwFoAU1234567890abcdefghijklmnopqrst0wDwYDVR0TAQH/BAUwAwEB/zAN
-BgkqhkiG9w0BAQsFAAOCAQEAabcdefghijklmnopqrstuvwxyz0123456789ABCDE
-FGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH
------END CERTIFICATE-----
-)CERT";
+// TLS certificates are now generated per-device at first boot
+// See cert_generator.h for implementation
 
-const char* server_key = R"KEY(
------BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDHQbkTeN+/1Hur
-Zc8nzDrEbl5B9Hq8Lkd0DlUbxHWZWTxhft4dvVwDlTkfVflXlflflflflflflfl
-flflflflflflflflflflflflflflflflflflflflflflflflflflflflflflfl
-flflflflflflflflflflflflflflflflflflflflflflflflflflflflflflfl
-flflflflflflflflflflflflflflflflflflflflflflflflflflflflflflfl
-flflflflflflflflflflflflflflflflflflflflflflflflflflflflflflfl
------END PRIVATE KEY-----
-)KEY";
 // ===== CONFIGURATION =====
 // WiFi credentials now stored in NVS, not hardcoded
 // Hold DOWN button during boot to enter WiFi setup mode
 const uint16_t SERVER_PORT = 8443;
 
 // ===== HARDWARE PINS =====
-// Your button wiring (Remapped):
-// - Confirm (OK)     = GPIO 15
-// - Blue Button 1 (UP)   = GPIO 5
-// - Blue Button 2 (DOWN) = GPIO 23
-// - Reject (BACK)    = GPIO 18
 const int BTN_OK = 15;     // Confirm
 const int BTN_UP = 5;      // Blue 1
-const int BTN_DOWN = 23;   // Blue 2 (User requested 23)
-const int BTN_BACK = 18;   // Reject (Between 5 and 23)
+const int BTN_DOWN = 23;   // Blue 2 
+const int BTN_BACK = 18;   // Reject 
 
 // ===== TLS CONFIGURATION =====
-#define USE_TLS_SERVER 1  // Set to 1 to enable TLS, 0 for plain TCP
+// TLS server with per-device certificates (generated at first boot)
+#define USE_TLS_SERVER 1  // Enabled - uses cert_generator.h for per-device certs
 #if USE_TLS_SERVER
 #include "tls_server.h"
-// tlsServer is declared in tls_server.h
+// tlsServer is declared globally in tls_server.h
 #endif
 
 // ===== GLOBAL OBJECTS =====
@@ -104,8 +75,6 @@ unsigned long last_serial_activity = 0;
 uint8_t pin_salt[16];  // Salt for PBKDF2
 uint8_t pin_key[16];   // Derived AES key from PIN
 bool pin_verified = false;
-int pin_attempts = 0;
-const int MAX_PIN_ATTEMPTS = 3;
 
 // ===== REPLAY PROTECTION =====
 const int NONCE_BUFFER_SIZE = 32;
@@ -114,9 +83,13 @@ int nonce_buffer_idx = 0;
 uint32_t last_msg_time = 0;
 const uint32_t MSG_VALIDITY_WINDOW = 60000;  // 60 seconds
 
-// ===== SESSION TIMEOUT =====
-unsigned long last_activity_time = 0;
-const unsigned long SESSION_TIMEOUT = 300000;  // 5 minutes auto-lock
+// ===== SESSION TIMEOUT (used by security_hardening.h) =====
+unsigned long lastActivityTime = 0;
+bool sessionActive = false;
+
+// ===== SIGN RATE LIMITING (used by security_hardening.h) =====
+unsigned long signTimestamps[SIGN_HISTORY_SIZE] = {0};
+uint8_t signTimestampIndex = 0;
 
 // ===== QR CODE DISPLAY TOGGLE =====
 bool showQRCode = true;  // Toggle between QR code and text IP display
@@ -473,7 +446,14 @@ uint8_t usb_nonce_counter = 0;
 #include "mbedtls/entropy.h"
 #include "mbedtls/ctr_drbg.h"
 
+// Throttle USB_READY to prevent serial buffer overflow
+static unsigned long lastUSBReadyTime = 0;
+
 void sendUSBReady() {
+  // Only send once per second max
+  if (millis() - lastUSBReadyTime < 1000) return;
+  lastUSBReadyTime = millis();
+  
   Serial.println("USB_READY");
   Serial.flush();
 }
@@ -708,6 +688,16 @@ void handleSerialCommand() {
       sendEncryptedUSB("{\"ok\":true,\"pong\":true}");
     }
     else if (strcmp(cmd, "SIGN") == 0) {
+      // SECURITY: Check sign rate limit
+      if (isSignRateLimited()) {
+        char rateLimitMsg[128];
+        unsigned long waitSec = (getRateLimitRemainingMs() / 1000) + 1;
+        snprintf(rateLimitMsg, sizeof(rateLimitMsg), 
+                 "{\"ok\":false,\"error\":\"rate_limited\",\"wait_seconds\":%lu}", waitSec);
+        sendEncryptedUSB(rateLimitMsg);
+        return;
+      }
+      
       const char* msgHex = doc["msg"];
       Serial.println("[CMD] SIGN request from USB");
       
@@ -767,20 +757,124 @@ void handleSerialCommand() {
     else if (strcmp(cmd, "SET_WIFI") == 0) {
       String ssid = doc["ssid"];
       String pass = doc["password"];
-      if (ssid.length() > 0) {
-        Preferences prefs;
-        prefs.begin("wifi", false);
-        prefs.putString("ssid", ssid);
-        prefs.putString("password", pass);
-        prefs.end();
+      
+      if (ssid.length() == 0) {
+        sendEncryptedUSB("{\"ok\":false,\"error\":\"empty_ssid\"}");
+        return;
+      }
+      
+      // SECURITY: Display confirmation on OLED and wait for button press
+      Serial.println("[USB] SET_WIFI: Showing confirmation screen");
+      u8g2.clearBuffer();
+      u8g2.setFont(u8g2_font_7x14B_tf);
+      u8g2.drawStr(5, 15, "SET WIFI?");
+      u8g2.setFont(u8g2_font_6x10_tf);
+      
+      // Truncate SSID if too long for display
+      String displaySsid = ssid.length() > 18 ? ssid.substring(0, 15) + "..." : ssid;
+      u8g2.drawStr(5, 30, displaySsid.c_str());
+      
+      u8g2.drawStr(5, 50, "OK=Confirm BACK=Cancel");
+      u8g2.sendBuffer();
+      
+      // Wait up to 30 seconds for button press
+      unsigned long confirmStart = millis();
+      bool confirmed = false;
+      bool cancelled = false;
+      
+      while (millis() - confirmStart < 30000 && !confirmed && !cancelled) {
+        if (digitalRead(BTN_OK) == LOW) {
+          delay(50); // Debounce
+          if (digitalRead(BTN_OK) == LOW) {
+            confirmed = true;
+            while (digitalRead(BTN_OK) == LOW) delay(10);
+          }
+        }
+        if (digitalRead(BTN_BACK) == LOW) {
+          delay(50); // Debounce
+          if (digitalRead(BTN_BACK) == LOW) {
+            cancelled = true;
+            while (digitalRead(BTN_BACK) == LOW) delay(10);
+          }
+        }
+        delay(10);
+      }
+      
+      if (confirmed) {
+        Preferences wifiPrefs;
+        wifiPrefs.begin("wifi", false);
+        wifiPrefs.putString("ssid", ssid);
+        wifiPrefs.putString("password", pass);
+        wifiPrefs.end();
+        
+        drawCentered("WiFi Saved!", 0);
         sendEncryptedUSB("{\"ok\":true}");
-        delay(500);
+        delay(1000);
         ESP.restart();
       } else {
-        sendEncryptedUSB("{\"ok\":false,\"error\":\"empty_ssid\"}");
+        drawCentered("WiFi Cancelled", 0);
+        sendEncryptedUSB("{\"ok\":false,\"error\":\"user_cancelled\"}");
+        delay(1500);
+        drawCentered("USB Mode", -10);
+        drawCentered("Connected", 10);
       }
     }
+    // RECOVERY_INIT - Generate and display recovery code on device
+    else if (strcmp(cmd, "RECOVERY_INIT") == 0) {
+      if (!pin_verified) {
+        sendEncryptedUSB("{\"ok\":false,\"error\":\"device_locked\"}");
+        return;
+      }
+      
+      // Generate random 6-digit code
+      recovery_code = esp_random() % 1000000;
+      recovery_code_expires = millis() + RECOVERY_CODE_TIMEOUT_MS;
+      
+      // Display on OLED
+      u8g2.clearBuffer();
+      u8g2.setFont(u8g2_font_7x14B_tf);
+      u8g2.drawStr(10, 15, "RECOVERY CODE:");
+      u8g2.setFont(u8g2_font_10x20_tf);
+      char codeStr[8];
+      snprintf(codeStr, sizeof(codeStr), "%06lu", recovery_code);
+      u8g2.drawStr(30, 40, codeStr);
+      u8g2.setFont(u8g2_font_6x10_tf);
+      u8g2.drawStr(0, 55, "Enter in app. 2min timeout");
+      u8g2.sendBuffer();
+      
+      Serial.println("[USB] Recovery code generated (not logged for security)");
+      sendEncryptedUSB("{\"ok\":true,\"message\":\"code_displayed\"}");
+    }
+    // RECOVER
     else if (strcmp(cmd, "RECOVER") == 0) {
+      if (!pin_verified) {
+        sendEncryptedUSB("{\"ok\":false,\"error\":\"device_locked\"}");
+        return;
+      }
+      
+      // SECURITY: Verify device code
+      if (recovery_code == 0 || millis() > recovery_code_expires) {
+        sendEncryptedUSB("{\"ok\":false,\"error\":\"no_recovery_code\",\"message\":\"Call RECOVERY_INIT first\"}");
+        return;
+      }
+      
+      uint32_t providedCode = doc["device_code"] | 0;
+      if (providedCode != recovery_code) {
+        sendEncryptedUSB("{\"ok\":false,\"error\":\"invalid_code\"}");
+        // Invalidate code after failed attempt
+        recovery_code = 0;
+        recovery_code_expires = 0;
+        drawCentered("Wrong code!", 0);
+        delay(2000);
+        drawCentered("USB Mode", -10);
+        drawCentered("Connected", 10);
+        return;
+      }
+      
+      // Code verified - invalidate it
+      recovery_code = 0;
+      recovery_code_expires = 0;
+      
       String words[12];
       bool hasWords = true;
       for (int i=0; i<12; i++) {
@@ -794,24 +888,29 @@ void handleSerialCommand() {
       
       if (hasWords) {
         drawCentered("Recovering...", 0);
-        uint8_t entropy[32];
-        mnemonicToEntropy(words, entropy);
+        
+        // Use BIP39 recovery
+        uint8_t seed[64];
+        if (!recoverBIP39(words, seed)) {
+          sendEncryptedUSB("{\"ok\":false,\"error\":\"invalid_mnemonic\"}");
+          drawCentered("Invalid words!", 0);
+          delay(2000);
+          drawCentered("USB Mode", -10);
+          drawCentered("Connected", 10);
+          return;
+        }
         
         uint8_t sk[32], pk[32];
-        entropyToKey(entropy, sk);
+        bip39ToKey(seed, sk);
         ed25519_publickey(sk, pk);
         
-        if (!pin_verified) {
-           sendEncryptedUSB("{\"ok\":false,\"error\":\"device_locked\"}");
+        if (storeRecoveredKey(prefs, pin_key, pin_salt, sk, pk, words)) {
+          sendEncryptedUSB("{\"ok\":true}");
+          drawCentered("Recovered!", 0);
+          delay(2000);
+          ESP.restart();
         } else {
-           if (generateAndStoreEncryptedKey(prefs, pin_key, pin_salt, sk, pk, words)) {
-             sendEncryptedUSB("{\"ok\":true}");
-             drawCentered("Recovered!", 0);
-             delay(2000);
-             ESP.restart();
-           } else {
-             sendEncryptedUSB("{\"ok\":false,\"error\":\"storage_failed\"}");
-           }
+          sendEncryptedUSB("{\"ok\":false,\"error\":\"storage_failed\"}");
         }
       } else {
         sendEncryptedUSB("{\"ok\":false,\"error\":\"missing_words\"}");
@@ -972,6 +1071,23 @@ void connectWiFi() {
     Serial.print("[WiFi] IP: "); Serial.println(WiFi.localIP());
     drawCentered("WiFi connected", 0);
     delay(1000);
+    
+    // Initialize TLS certificates (generates on first boot, ~30sec)
+    #if USE_TLS_SERVER
+    drawCentered("Init TLS certs...", 0);
+    if (!initTLSCerts()) {
+      Serial.println("[TLS] Certificate initialization failed!");
+      drawCentered("TLS CERT FAIL", 0);
+      delay(3000);
+    } else {
+      Serial.println("[TLS] Certificates ready");
+      // Start TLS server
+      tlsServer.begin();
+      Serial.println("[TLS] TLS server started on port 8443");
+      drawCentered("TLS Ready", 0);
+      delay(500);
+    }
+    #endif
   } else {
     Serial.println("\n[WiFi] FAILED!");
     drawCentered("WiFi FAILED", 0);
@@ -1376,9 +1492,9 @@ void setup() {
   bool hasLegacyKey = hasPlainKey(prefs);
   bool needsPIN = hasEncryptedKey(prefs);
   
-  // Load persistent PIN attempt counter
-  pin_attempts = prefs.getInt("pin_fails", 0);
-  if (pin_attempts >= MAX_PIN_ATTEMPTS) {
+  // Load persistent PIN attempt counter using security_hardening.h
+  uint8_t failedAttempts = loadFailedPinAttempts(prefs);
+  if (shouldWipeDevice(failedAttempts)) {
     drawCentered("LOCKED!", -10);
     drawCentered("Too many attempts", 10);
     while (true) delay(1000);  // Lock device permanently
@@ -1498,10 +1614,11 @@ void setup() {
     for (int i = 0; i < 8; i++) Serial.printf("%02X", debug_enc[i]);
     Serial.println();
     
-    while (!pin_verified && pin_attempts < MAX_PIN_ATTEMPTS) {
+    uint8_t currentFailures = loadFailedPinAttempts(prefs);
+    while (!pin_verified && !shouldWipeDevice(currentFailures)) {
       drawCentered("Enter PIN", -10);
-      char attemptStr[20];
-      snprintf(attemptStr, sizeof(attemptStr), "Attempt %d/%d", pin_attempts + 1, MAX_PIN_ATTEMPTS);
+      char attemptStr[32];
+      snprintf(attemptStr, sizeof(attemptStr), "Attempts: %d/%d", currentFailures, MAX_PIN_ATTEMPTS);
       drawCentered(attemptStr, 10);
       delay(500);
       
@@ -1517,7 +1634,8 @@ void setup() {
       drawCentered("Verifying...", 0);
       if (loadEncryptedKey(prefs, pin_key, ed25519_sk, ed25519_pk)) {
         pin_verified = true;
-        last_activity_time = millis();  // Initialize session timer
+        sessionActive = true;
+        resetActivityTimer();  // Initialize session timer
         
         // Debug: Show loaded pubkey
         Serial.print("[Key] Loaded pubkey: ");
@@ -1525,7 +1643,7 @@ void setup() {
         Serial.println();
         
         // Clear failed attempts on success
-        prefs.putInt("pin_fails", 0);
+        clearFailedPinAttempts(prefs);
         
         // Load mnemonic (encrypted in newer versions)
         // SECURITY: No logging of cryptographic material
@@ -1581,18 +1699,25 @@ void setup() {
           }
         }
       } else {
-        pin_attempts++;
+        // Handle failed PIN attempt with exponential backoff
+        unsigned long lockoutDelay = 0;
+        uint8_t remaining = handleFailedPinAttempt(prefs, lockoutDelay);
+        currentFailures = loadFailedPinAttempts(prefs);
         
-        // Save failed attempts to NVS (survives reboot)
-        prefs.putInt("pin_fails", pin_attempts);
-        
-        if (pin_attempts >= MAX_PIN_ATTEMPTS) {
-          drawCentered("LOCKED!", -10);
+        if (shouldWipeDevice(currentFailures)) {
+          drawCentered("WIPED!", -10);
           drawCentered("Too many attempts", 10);
-          while (true) delay(1000);  // Lock device
+          delay(3000);
+          ESP.restart();
         } else {
-          drawCentered("Wrong PIN!", 0);
-          delay(1500);
+          // Show lockout delay
+          char lockoutMsg[32];
+          drawCentered("Wrong PIN!", -15);
+          snprintf(lockoutMsg, sizeof(lockoutMsg), "%d attempts left", remaining);
+          drawCentered(lockoutMsg, 0);
+          snprintf(lockoutMsg, sizeof(lockoutMsg), "Wait %lu sec", lockoutDelay / 1000);
+          drawCentered(lockoutMsg, 15);
+          delay(lockoutDelay);  // Exponential backoff delay
         }
       }
     }
@@ -1656,7 +1781,7 @@ void loop() {
       if (tlsClient->begin(&rawClient)) {
         Serial.println("[TLS] Client connected securely!");
         drawCentered("TLS Connected!", 0);
-        last_activity_time = millis();  // Reset activity timer
+        resetActivityTimer();  // Reset activity timer
         
         // Handle TLS client (simplified protocol)
         while (tlsClient->connected()) {
@@ -1665,7 +1790,7 @@ void loop() {
             line.trim();
             if (line.length() > 0) {
               Serial.print("[TLS] Received: "); Serial.println(line);
-              last_activity_time = millis();  // Reset on each message
+              resetActivityTimer();  // Reset on each message
               
               // Process JSON command
               StaticJsonDocument<1024> doc;
@@ -1755,19 +1880,95 @@ void loop() {
                 else if (strcmp(cmd, "SET_WIFI") == 0) {
                   String ssid = doc["ssid"];
                   String pass = doc["password"];
-                  if (ssid.length() > 0) {
-                    prefs.putString("wifi_ssid", ssid);
-                    prefs.putString("wifi_pass", pass);
+                  
+                  if (ssid.length() == 0) {
+                    tlsClient->println("{\"ok\":false,\"error\":\"empty_ssid\"}");
+                    continue;
+                  }
+                  
+                  // SECURITY: Display confirmation on OLED and wait for button press
+                  Serial.println("[TLS] SET_WIFI: Showing confirmation screen");
+                  u8g2.clearBuffer();
+                  u8g2.setFont(u8g2_font_7x14B_tf);
+                  u8g2.drawStr(5, 15, "SET WIFI?");
+                  u8g2.setFont(u8g2_font_6x10_tf);
+                  
+                  String displaySsid = ssid.length() > 18 ? ssid.substring(0, 15) + "..." : ssid;
+                  u8g2.drawStr(5, 30, displaySsid.c_str());
+                  
+                  u8g2.drawStr(5, 50, "OK=Confirm BACK=Cancel");
+                  u8g2.sendBuffer();
+                  
+                  // Wait up to 30 seconds for button press
+                  unsigned long confirmStart = millis();
+                  bool confirmed = false;
+                  bool cancelled = false;
+                  
+                  while (millis() - confirmStart < 30000 && !confirmed && !cancelled) {
+                    if (digitalRead(BTN_OK) == LOW) {
+                      delay(50);
+                      if (digitalRead(BTN_OK) == LOW) {
+                        confirmed = true;
+                        while (digitalRead(BTN_OK) == LOW) delay(10);
+                      }
+                    }
+                    if (digitalRead(BTN_BACK) == LOW) {
+                      delay(50);
+                      if (digitalRead(BTN_BACK) == LOW) {
+                        cancelled = true;
+                        while (digitalRead(BTN_BACK) == LOW) delay(10);
+                      }
+                    }
+                    delay(10);
+                  }
+                  
+                  if (confirmed) {
+                    Preferences wifiPrefs;
+                    wifiPrefs.begin("wifi", false);
+                    wifiPrefs.putString("ssid", ssid);
+                    wifiPrefs.putString("password", pass);
+                    wifiPrefs.end();
+                    
+                    drawCentered("WiFi Saved!", 0);
                     tlsClient->println("{\"ok\":true}");
-                    delay(500);
+                    delay(1000);
                     ESP.restart();
                   } else {
-                    tlsClient->println("{\"ok\":false,\"error\":\"empty_ssid\"}");
+                    drawCentered("WiFi Cancelled", 0);
+                    tlsClient->println("{\"ok\":false,\"error\":\"user_cancelled\"}");
+                    delay(1500);
+                    String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
+                    drawCentered(ipMsg.c_str(), 10);
                   }
                 }
                 else if (strcmp(cmd, "RECOVER") == 0) {
-                  // Recovery protocol: PC sends "RECOVER" check, but current python sends words immediately
-                  // Let's handle the words if they are present
+                  if (!pin_verified) {
+                    tlsClient->println("{\"ok\":false,\"error\":\"device_locked\"}");
+                    continue;
+                  }
+                  
+                  // SECURITY: Verify device code
+                  if (recovery_code == 0 || millis() > recovery_code_expires) {
+                    tlsClient->println("{\"ok\":false,\"error\":\"no_recovery_code\",\"message\":\"Call RECOVERY_INIT first\"}");
+                    continue;
+                  }
+                  
+                  uint32_t providedCode = doc["device_code"] | 0;
+                  if (providedCode != recovery_code) {
+                    tlsClient->println("{\"ok\":false,\"error\":\"invalid_code\"}");
+                    recovery_code = 0;
+                    recovery_code_expires = 0;
+                    drawCentered("Wrong code!", 0);
+                    delay(2000);
+                    String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
+                    drawCentered(ipMsg.c_str(), 10);
+                    continue;
+                  }
+                  
+                  // Code verified - invalidate it
+                  recovery_code = 0;
+                  recovery_code_expires = 0;
+                  
                   String words[12];
                   bool hasWords = true;
                   for (int i=0; i<12; i++) {
@@ -1781,40 +1982,61 @@ void loop() {
                   
                   if (hasWords) {
                     drawCentered("Recovering...", 0);
-                    // Convert mnemonic to entropy with validation
-                    uint8_t entropy[12];
-                    if (!mnemonicToEntropy(words, entropy)) {
+                    
+                    // Use BIP39 recovery
+                    uint8_t seed[64];
+                    if (!recoverBIP39(words, seed)) {
                       tlsClient->println("{\"ok\":false,\"error\":\"invalid_mnemonic\"}");
                       drawCentered("Invalid words!", 0);
                       delay(2000);
                     } else {
                       uint8_t sk[32], pk[32];
-                      entropyToKey(entropy, sk);
+                      bip39ToKey(seed, sk);
                       ed25519_publickey(sk, pk);
                       
-                      if (!pin_verified) {
-                         tlsClient->println("{\"ok\":false,\"error\":\"device_locked\"}");
+                      if (storeRecoveredKey(prefs, pin_key, pin_salt, sk, pk, words)) {
+                        memcpy(ed25519_sk, sk, 32);
+                        memcpy(ed25519_pk, pk, 32);
+                        for (int i = 0; i < 12; i++) {
+                          mnemonicWords[i] = words[i];
+                        }
+                        tlsClient->println("{\"ok\":true}");
+                        drawCentered("Recovered!", 0);
+                        delay(2000);
+                        ESP.restart();
                       } else {
-                         // Use storeRecoveredKey to save the recovered key
-                         if (storeRecoveredKey(prefs, pin_key, pin_salt, sk, pk, words)) {
-                           // Update global variables
-                           memcpy(ed25519_sk, sk, 32);
-                           memcpy(ed25519_pk, pk, 32);
-                           for (int i = 0; i < 12; i++) {
-                             mnemonicWords[i] = words[i];
-                           }
-                           tlsClient->println("{\"ok\":true}");
-                           drawCentered("Recovered!", 0);
-                           delay(2000);
-                           ESP.restart();
-                         } else {
-                           tlsClient->println("{\"ok\":false,\"error\":\"storage_failed\"}");
-                         }
+                        tlsClient->println("{\"ok\":false,\"error\":\"storage_failed\"}");
                       }
                     }
                   } else {
                     tlsClient->println("{\"ok\":false,\"error\":\"missing_words\"}");
                   }
+                }
+                // RECOVERY_INIT - Generate and display recovery code on device
+                else if (strcmp(cmd, "RECOVERY_INIT") == 0) {
+                  if (!pin_verified) {
+                    tlsClient->println("{\"ok\":false,\"error\":\"device_locked\"}");
+                    continue;
+                  }
+                  
+                  // Generate random 6-digit code
+                  recovery_code = esp_random() % 1000000;
+                  recovery_code_expires = millis() + RECOVERY_CODE_TIMEOUT_MS;
+                  
+                  // Display on OLED
+                  u8g2.clearBuffer();
+                  u8g2.setFont(u8g2_font_7x14B_tf);
+                  u8g2.drawStr(10, 15, "RECOVERY CODE:");
+                  u8g2.setFont(u8g2_font_10x20_tf);
+                  char codeStr[8];
+                  snprintf(codeStr, sizeof(codeStr), "%06lu", recovery_code);
+                  u8g2.drawStr(30, 40, codeStr);
+                  u8g2.setFont(u8g2_font_6x10_tf);
+                  u8g2.drawStr(0, 55, "Enter in app. 2min timeout");
+                  u8g2.sendBuffer();
+                  
+                  Serial.println("[TLS] Recovery code generated (not logged)");
+                  tlsClient->println("{\"ok\":true,\"message\":\"code_displayed\"}");
                 }
                 else {
                   tlsClient->println("{\"ok\":false,\"error\":\"unknown_cmd\"}");
@@ -1836,7 +2058,7 @@ void loop() {
     
     if (client) {
       handleClient(client);
-      last_activity_time = millis();  // Reset activity timer
+      resetActivityTimer();  // Reset activity timer
     }
 #endif
 
@@ -1846,10 +2068,11 @@ void loop() {
 #endif
   }
   
-  // Session timeout - auto-lock after inactivity
-  if (pin_verified && (millis() - last_activity_time > SESSION_TIMEOUT)) {
+  // Session timeout - auto-lock after inactivity (using security_hardening.h)
+  if (pin_verified && isSessionTimedOut()) {
     Serial.println("[SEC] Session timeout - locking device");
     pin_verified = false;
+    sessionActive = false;
     memset(ed25519_sk, 0, 32);  // Clear private key from RAM
     memset(aes_key, 0, 16);     // Clear session key
     drawCentered("Session Timeout", -10);
@@ -1990,7 +2213,7 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
   
   const char* cmd = doc["cmd"] | "";
   Serial.print("[WS] Command: "); Serial.println(cmd);
-  last_activity_time = millis();  // Reset activity timer
+  resetActivityTimer();  // Reset activity timer
   
   // KEY_EXCHANGE - establish secure channel
   if (strcmp(cmd, "KEY_EXCHANGE") == 0) {
@@ -2043,14 +2266,93 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
     mbedtls_sha256(key_material, 72, hash, 0);
     memcpy(aes_key, hash, 16);
     
+    // Derive 6-digit pairing code from hash (same algorithm as mobile app)
+    uint32_t pairingCode = ((uint32_t)hash[16] << 16 | (uint32_t)hash[17] << 8 | (uint32_t)hash[18]) % 1000000;
+    
+    // Display pairing code on OLED for user verification
+    char codeStr[8];
+    snprintf(codeStr, sizeof(codeStr), "%06lu", pairingCode);
+    
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_7x14B_tf);
+    u8g2.drawStr(5, 15, "MOBILE PAIRING");
+    u8g2.setFont(u8g2_font_10x20_tf);
+    u8g2.drawStr(30, 40, codeStr);
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 55, "OK=Allow  BACK=Deny");
+    u8g2.sendBuffer();
+    
+    // Send pairing code to mobile BEFORE waiting for button
+    // This allows user to see code on both screens at the same time
+    StaticJsonDocument<256> pairResp;
+    pairResp["status"] = "pending";
+    pairResp["code"] = String(codeStr);
+    pairResp["ecdh_pub"] = bytesToHex(wallet_pub, 65);
+    pairResp["salt"] = bytesToHex(channel_salt, 8);
+    String pairOut;
+    serializeJson(pairResp, pairOut);
+    wsServer.sendTXT(num, pairOut.c_str());
+    
+    Serial.println("[WS] Sent pairing code, waiting for user confirmation...");
+    
+    // Wait for button press (30 second timeout)
+    unsigned long confirmStart = millis();
+    bool approved = false;
+    bool denied = false;
+    
+    while (millis() - confirmStart < 30000 && !approved && !denied) {
+      if (digitalRead(BTN_OK) == LOW) {
+        delay(50);
+        if (digitalRead(BTN_OK) == LOW) {
+          approved = true;
+          while (digitalRead(BTN_OK) == LOW) delay(10);
+        }
+      }
+      if (digitalRead(BTN_BACK) == LOW) {
+        delay(50);
+        if (digitalRead(BTN_BACK) == LOW) {
+          denied = true;
+          while (digitalRead(BTN_BACK) == LOW) delay(10);
+        }
+      }
+      delay(10);
+    }
+    
+    if (!approved) {
+      // Connection denied or timeout
+      Serial.println("[WS] Connection denied by user");
+      drawCentered("Denied!", 0);
+      StaticJsonDocument<128> rejectResp;
+      rejectResp["ok"] = false;
+      rejectResp["error"] = "user_denied";
+      String rejectOut;
+      serializeJson(rejectResp, rejectOut);
+      wsServer.sendTXT(num, rejectOut.c_str());
+      delay(1500);
+      String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
+      drawCentered("TLS+WS Ready", -10);
+      drawCentered(ipMsg.c_str(), 10);
+      
+      // Cleanup
+      mbedtls_ecp_group_free(&grp);
+      mbedtls_mpi_free(&d);
+      mbedtls_ecp_point_free(&Q);
+      mbedtls_entropy_free(&entropy);
+      mbedtls_ctr_drbg_free(&ctr_drbg);
+      return;
+    }
+    
+    // User approved!
+    Serial.println("[WS] Connection approved by user");
     secure_channel_ready = true;
     tx_counter = 1;
     
-    // Send response
+    // Send response with pairing code for mobile app to verify
     StaticJsonDocument<256> resp;
     resp["ok"] = true;
     resp["ecdh_pub"] = bytesToHex(wallet_pub, 65);
     resp["salt"] = bytesToHex(channel_salt, 8);
+    resp["code"] = String(codeStr);  // Send code so mobile can display it too
     
     String out;
     serializeJson(resp, out);
@@ -2065,7 +2367,7 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
     
     Serial.println("[WS] Secure channel established!");
     drawCentered("Secure Channel", -10);
-    drawCentered("Ready!", 10);
+    drawCentered("Connected!", 10);
     return;
   }
   
@@ -2089,6 +2391,16 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
   else if (strcmp(cmd, "SIGN") == 0) {
     if (!pin_verified) {
       wsSendEncrypted(num, "{\"ok\":false,\"error\":\"device_locked\"}");
+      return;
+    }
+    
+    // SECURITY: Check sign rate limit
+    if (isSignRateLimited()) {
+      char rateLimitMsg[128];
+      unsigned long waitSec = (getRateLimitRemainingMs() / 1000) + 1;
+      snprintf(rateLimitMsg, sizeof(rateLimitMsg), 
+               "{\"ok\":false,\"error\":\"rate_limited\",\"wait_seconds\":%lu}", waitSec);
+      wsSendEncrypted(num, rateLimitMsg);
       return;
     }
     
@@ -2291,64 +2603,44 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
     if (hasWords) {
       drawCentered("Recovering...", 0);
       
-      // Convert mnemonic to entropy (skip checksum for recovery flexibility)
-      uint8_t entropy[12];
-      bool allWordsValid = true;
-      for (int i = 0; i < 12 && allWordsValid; i++) {
-        bool found = false;
-        for (int j = 0; j < 256; j++) {
-          // On ESP32, PROGMEM is directly accessible (no pgm_read needed)
-          if (words[i].equals(MNEMONIC_WORDS[j])) {
-            entropy[i] = j;
-            found = true;
-            break;
-          }
-        }
-        if (!found) {
-          allWordsValid = false;
-          Serial.println("[WS] Invalid word: " + words[i]);
-        }
-      }
       
-      if (!allWordsValid) {
-        wsSendEncrypted(num, "{\"ok\":false,\"error\":\"invalid_word\"}");
-        drawCentered("Invalid word!", 0);
-        delay(2000);
-        return;
-      }
+      uint8_t sk[32];
+      uint8_t pk[32];
       
-      // Derive key from entropy
-      uint8_t sk[32], pk[32];
-      entropyToKey(entropy, sk);
-      ed25519_publickey(sk, pk);
-      
-      // Debug: Show derived pubkey
-      Serial.print("[RECOVERY] New pubkey bytes: ");
-      for (int i = 0; i < 32; i++) Serial.printf("%02X", pk[i]);
-      Serial.println();
-      
-      // Close and reopen prefs to ensure write access
-      prefs.end();
-      prefs.begin("wallet", false);  // false = read-write mode
-      
-      // Store the RECOVERED key (uses storeRecoveredKey, NOT generateAndStoreEncryptedKey)
-      if (storeRecoveredKey(prefs, pin_key, pin_salt, sk, pk, words)) {
-        // Also update the global key variables
-        memcpy(ed25519_sk, sk, 32);
-        memcpy(ed25519_pk, pk, 32);
-        for (int i = 0; i < 12; i++) {
-          mnemonicWords[i] = words[i];
-        }
+      // BIP39 Recovery
+      uint8_t bip39Seed[64];
+      if (recoverBIP39(words, bip39Seed)) {
+        Serial.println("[Recovery] Valid BIP39 mnemonic");
+        bip39ToKey(bip39Seed, sk);
+        ed25519_publickey(sk, pk);
         
-        wsSendEncrypted(num, "{\"ok\":true}");
-        drawCentered("Recovered!", 0);
-        delay(2000);
-        ESP.restart();
+        // Close and reopen prefs to ensure write access
+        prefs.end();
+        prefs.begin("wallet", false);
+        
+        // Store the RECOVERED key
+        if (storeRecoveredKey(prefs, pin_key, pin_salt, sk, pk, words)) {
+          memcpy(ed25519_sk, sk, 32);
+          memcpy(ed25519_pk, pk, 32);
+          for (int i = 0; i < 12; i++) {
+            mnemonicWords[i] = words[i];
+          }
+          
+          wsSendEncrypted(num, "{\"ok\":true}");
+          drawCentered("Recovered!", 0);
+          delay(2000);
+          ESP.restart();
+        } else {
+          wsSendEncrypted(num, "{\"ok\":false,\"error\":\"storage_failed\"}");
+          drawCentered("Storage error!", 0);
+          delay(2000);
+        }
       } else {
-        wsSendEncrypted(num, "{\"ok\":false,\"error\":\"storage_failed\"}");
-        drawCentered("Storage error!", 0);
+        wsSendEncrypted(num, "{\"ok\":false,\"error\":\"invalid_mnemonic\"}");
+        drawCentered("Invalid Words", 0);
         delay(2000);
       }
+
     } else {
       wsSendEncrypted(num, "{\"ok\":false,\"error\":\"missing_words\"}");
     }
