@@ -91,6 +91,11 @@ uint32_t tx_counter = 1;
 // Initialize with zeros - will be set during ECDH key exchange
 bool secure_channel_ready = false;
 
+// ===== RECOVERY CODE (Physical Access Verification) =====
+uint32_t recovery_code = 0;  // 6-digit code displayed on device
+unsigned long recovery_code_expires = 0;  // Expiration time
+const unsigned long RECOVERY_CODE_TIMEOUT_MS = 120000;  // 2 minutes
+
 // ===== USB SERIAL MODE =====
 bool usb_mode_active = false;
 unsigned long last_serial_activity = 0;
@@ -977,15 +982,7 @@ void connectWiFi() {
 
 // ===== MNEMONIC DISPLAY =====
 void displayMnemonic() {
-  // Debug: Print all words to serial
-  Serial.println("[MNEMONIC] Displaying mnemonic words:");
-  for (int i = 0; i < 12; i++) {
-    Serial.print("[MNEMONIC] Word ");
-    Serial.print(i + 1);
-    Serial.print(": '");
-    Serial.print(mnemonicWords[i]);
-    Serial.println("'");
-  }
+  // SECURITY: Mnemonic is never logged to Serial
   
   drawCentered("BACKUP PHRASE", -20);
   drawCentered("Write these down!", 0);
@@ -1531,56 +1528,42 @@ void setup() {
         prefs.putInt("pin_fails", 0);
         
         // Load mnemonic (encrypted in newer versions)
-        Serial.println("[MNEM_LOAD] Checking for encrypted mnemonic...");
-        Serial.print("[MNEM_LOAD] enc_mnem exists: "); Serial.println(prefs.isKey("enc_mnem") ? "YES" : "NO");
-        Serial.print("[MNEM_LOAD] mnemonic exists: "); Serial.println(prefs.isKey("mnemonic") ? "YES" : "NO");
+        // SECURITY: No logging of cryptographic material
         
         if (prefs.isKey("enc_mnem")) {
           // Decrypt mnemonic
           int mnem_len = prefs.getInt("mnem_len", 0);
-          Serial.print("[MNEM_LOAD] mnem_len: "); Serial.println(mnem_len);
+          if (mnem_len <= 0 || mnem_len > 200) {
+            // Invalid length, skip loading
+          } else {
+            uint8_t mnem_ct[256], mnem_iv[12], mnem_tag[16];
+            prefs.getBytes("enc_mnem", mnem_ct, mnem_len);
+            prefs.getBytes("mnem_iv", mnem_iv, 12);
+            prefs.getBytes("mnem_tag", mnem_tag, 16);
+            
+            uint8_t decrypted[256];
+            mbedtls_gcm_context gcm;
+            mbedtls_gcm_init(&gcm);
+            mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, pin_key, 128);
+            int ret = mbedtls_gcm_auth_decrypt(&gcm, mnem_len, mnem_iv, 12,
+                                      NULL, 0, mnem_tag, 16,
+                                      mnem_ct, decrypted);
+            mbedtls_gcm_free(&gcm);
+            
+            if (ret == 0) {
+              decrypted[mnem_len] = '\0';
+              String mnemonicStr = String((char*)decrypted);
           
-          // Debug: print pin_key being used
-          Serial.print("[MNEM_LOAD] pin_key (first 4 bytes): ");
-          for (int i = 0; i < 4; i++) Serial.printf("%02X", pin_key[i]);
-          Serial.println();
-          
-          uint8_t mnem_ct[256], mnem_iv[12], mnem_tag[16];
-          prefs.getBytes("enc_mnem", mnem_ct, mnem_len);
-          prefs.getBytes("mnem_iv", mnem_iv, 12);
-          prefs.getBytes("mnem_tag", mnem_tag, 16);
-          
-          // Debug: print IV and tag
-          Serial.print("[MNEM_LOAD] mnem_iv: ");
-          for (int i = 0; i < 12; i++) Serial.printf("%02X", mnem_iv[i]);
-          Serial.println();
-          Serial.print("[MNEM_LOAD] mnem_tag: ");
-          for (int i = 0; i < 16; i++) Serial.printf("%02X", mnem_tag[i]);
-          Serial.println();
-          
-          uint8_t decrypted[256];
-          mbedtls_gcm_context gcm;
-          mbedtls_gcm_init(&gcm);
-          mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, pin_key, 128);
-          int ret = mbedtls_gcm_auth_decrypt(&gcm, mnem_len, mnem_iv, 12,
-                                    NULL, 0, mnem_tag, 16,
-                                    mnem_ct, decrypted);
-          mbedtls_gcm_free(&gcm);
-          
-          Serial.print("[MNEM_LOAD] Decrypt result: "); Serial.println(ret);
-          
-          decrypted[mnem_len] = '\0';
-          String mnemonicStr = String((char*)decrypted);
-          Serial.print("[MNEM_LOAD] Decrypted string: '"); Serial.print(mnemonicStr); Serial.println("'");
-          
-          int wordIndex = 0;
-          int start = 0;
-          for (int i = 0; i <= mnemonicStr.length(); i++) {
-            if (i == mnemonicStr.length() || mnemonicStr[i] == ' ') {
-              if (wordIndex < 12) {
-                mnemonicWords[wordIndex++] = mnemonicStr.substring(start, i);
+              int wordIndex = 0;
+              int start = 0;
+              for (int i = 0; i <= mnemonicStr.length(); i++) {
+                if (i == mnemonicStr.length() || mnemonicStr[i] == ' ') {
+                  if (wordIndex < 12) {
+                    mnemonicWords[wordIndex++] = mnemonicStr.substring(start, i);
+                  }
+                  start = i + 1;
+                }
               }
-              start = i + 1;
             }
           }
         } else if (prefs.isKey("mnemonic")) {
@@ -1907,18 +1890,184 @@ void wsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
   }
 }
 
+// Helper: Check if string is valid hex
+bool isHexString(const char* str, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    char c = str[i];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+      return false;
+    }
+  }
+  return len > 24; // At least 12 bytes nonce + some ciphertext
+}
+
+// Note: hexToBytes already defined earlier at line 138
+
+// Send encrypted response via WebSocket
+void wsSendEncrypted(uint8_t num, const char* response) {
+  if (secure_channel_ready) {
+    // Encrypt response using AES-GCM
+    uint8_t nonce[12];
+    memcpy(nonce, channel_salt, 8);
+    uint32_t counter_val = tx_counter++;
+    memcpy(nonce + 8, &counter_val, 4);
+    
+    size_t plainLen = strlen(response);
+    uint8_t ciphertext[plainLen + 16]; // +16 for GCM tag
+    uint8_t tag[16];
+    
+    mbedtls_gcm_context gcm;
+    mbedtls_gcm_init(&gcm);
+    mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, aes_key, 128);
+    mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, plainLen,
+                              nonce, 12, NULL, 0,
+                              (const uint8_t*)response, ciphertext, 16, tag);
+    mbedtls_gcm_free(&gcm);
+    
+    // Combine: nonce (12) + ciphertext + tag (16)
+    String hexOutput = bytesToHex(nonce, 12);
+    hexOutput += bytesToHex(ciphertext, plainLen);
+    hexOutput += bytesToHex(tag, 16);
+    
+    wsServer.sendTXT(num, hexOutput.c_str());
+  } else {
+    wsServer.sendTXT(num, response);
+  }
+}
+
 void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
   StaticJsonDocument<2048> doc;
-  DeserializationError err = deserializeJson(doc, payload, length);
+  String decryptedPayload;
   
-  if (err) {
-    wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"invalid_json\"}");
-    return;
+  // Check if this is an encrypted message (hex string)
+  if (secure_channel_ready && isHexString((const char*)payload, length)) {
+    // Decrypt the message
+    size_t dataLen = length / 2;
+    uint8_t* encData = new uint8_t[dataLen];
+    hexToBytes((const char*)payload, encData, dataLen);
+    
+    // Extract nonce (12 bytes) and ciphertext+tag
+    uint8_t nonce[12];
+    memcpy(nonce, encData, 12);
+    size_t cipherLen = dataLen - 12 - 16; // Total - nonce - tag
+    uint8_t* plaintext = new uint8_t[cipherLen + 1];
+    uint8_t tag[16];
+    memcpy(tag, encData + dataLen - 16, 16);
+    
+    mbedtls_gcm_context gcm;
+    mbedtls_gcm_init(&gcm);
+    mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, aes_key, 128);
+    int ret = mbedtls_gcm_auth_decrypt(&gcm, cipherLen, nonce, 12,
+                                        NULL, 0, tag, 16,
+                                        encData + 12, plaintext);
+    mbedtls_gcm_free(&gcm);
+    
+    delete[] encData;
+    
+    if (ret != 0) {
+      delete[] plaintext;
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"decryption_failed\"}");
+      return;
+    }
+    
+    plaintext[cipherLen] = '\0';
+    decryptedPayload = String((char*)plaintext);
+    delete[] plaintext;
+    
+    DeserializationError err = deserializeJson(doc, decryptedPayload);
+    if (err) {
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"invalid_json\"}");
+      return;
+    }
+  } else {
+    // Not encrypted - parse directly (for KEY_EXCHANGE and initial connection)
+    DeserializationError err = deserializeJson(doc, payload, length);
+    if (err) {
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"invalid_json\"}");
+      return;
+    }
   }
   
   const char* cmd = doc["cmd"] | "";
   Serial.print("[WS] Command: "); Serial.println(cmd);
   last_activity_time = millis();  // Reset activity timer
+  
+  // KEY_EXCHANGE - establish secure channel
+  if (strcmp(cmd, "KEY_EXCHANGE") == 0) {
+    const char* peerPubHex = doc["pubkey"] | "";
+    if (strlen(peerPubHex) != 64) { // 32 bytes = 64 hex chars
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"invalid_pubkey\"}");
+      return;
+    }
+    
+    uint8_t peerPub[32];
+    hexToBytes(peerPubHex, peerPub, 32);
+    
+    // Create a dummy WiFiClient for handleKeyExchange (we'll send via WS instead)
+    // For now, inline the key exchange for WebSocket
+    
+    // Initialize ECDH
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    mbedtls_entropy_init(&entropy);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+    const char *pers = "ws_ecdh";
+    mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
+                          (const unsigned char *)pers, strlen(pers));
+    
+    mbedtls_ecp_group grp;
+    mbedtls_mpi d;
+    mbedtls_ecp_point Q;
+    mbedtls_ecp_group_init(&grp);
+    mbedtls_mpi_init(&d);
+    mbedtls_ecp_point_init(&Q);
+    mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
+    mbedtls_ecdh_gen_public(&grp, &d, &Q, mbedtls_ctr_drbg_random, &ctr_drbg);
+    
+    // Export our public key
+    unsigned char wallet_pub[65];
+    size_t olen = 0;
+    mbedtls_ecp_point_write_binary(&grp, &Q, MBEDTLS_ECP_PF_UNCOMPRESSED,
+                                    &olen, wallet_pub, sizeof(wallet_pub));
+    
+    // Generate session salt
+    esp_fill_random(channel_salt, 8);
+    
+    // Derive shared key
+    uint8_t key_material[72];
+    memcpy(key_material, wallet_pub + 1, 32);
+    memcpy(key_material + 32, peerPub, 32);
+    memcpy(key_material + 64, channel_salt, 8);
+    
+    uint8_t hash[32];
+    mbedtls_sha256(key_material, 72, hash, 0);
+    memcpy(aes_key, hash, 16);
+    
+    secure_channel_ready = true;
+    tx_counter = 1;
+    
+    // Send response
+    StaticJsonDocument<256> resp;
+    resp["ok"] = true;
+    resp["ecdh_pub"] = bytesToHex(wallet_pub, 65);
+    resp["salt"] = bytesToHex(channel_salt, 8);
+    
+    String out;
+    serializeJson(resp, out);
+    wsServer.sendTXT(num, out.c_str()); // Send unencrypted (key not yet known to client)
+    
+    // Cleanup
+    mbedtls_ecp_group_free(&grp);
+    mbedtls_mpi_free(&d);
+    mbedtls_ecp_point_free(&Q);
+    mbedtls_entropy_free(&entropy);
+    mbedtls_ctr_drbg_free(&ctr_drbg);
+    
+    Serial.println("[WS] Secure channel established!");
+    drawCentered("Secure Channel", -10);
+    drawCentered("Ready!", 10);
+    return;
+  }
   
   // PUBKEY
   if (strcmp(cmd, "PUBKEY") == 0) {
@@ -1930,22 +2079,22 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
     String pubkeyB58 = bytesToBase58(ed25519_pk, 32);
     Serial.println("[PUBKEY] Base58: " + pubkeyB58);
     String resp = "{\"ok\":true,\"pubkey\":\"" + pubkeyB58 + "\"}";
-    wsServer.sendTXT(num, resp);
+    wsSendEncrypted(num, resp.c_str());
   }
   // PING
   else if (strcmp(cmd, "PING") == 0) {
-    wsServer.sendTXT(num, "{\"ok\":true,\"pong\":true}");
+    wsSendEncrypted(num, "{\"ok\":true,\"pong\":true}");
   }
   // SIGN
   else if (strcmp(cmd, "SIGN") == 0) {
     if (!pin_verified) {
-      wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"device_locked\"}");
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"device_locked\"}");
       return;
     }
     
     const char* msgHex = doc["msg"];
     if (!msgHex) {
-      wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"missing_msg\"}");
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"missing_msg\"}");
       return;
     }
     
@@ -1989,7 +2138,7 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
     
     String out;
     serializeJson(resp, out);
-    wsServer.sendTXT(num, out);
+    wsSendEncrypted(num, out.c_str());
     delay(1000);
     String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
     drawCentered("TLS+WS Ready", -10);
@@ -1998,37 +2147,135 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
   // SHOW_MNEMONIC
   else if (strcmp(cmd, "SHOW_MNEMONIC") == 0) {
     if (!pin_verified) {
-      wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"device_locked\"}");
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"device_locked\"}");
       return;
     }
     displayMnemonic();
-    wsServer.sendTXT(num, "{\"ok\":true}");
+    wsSendEncrypted(num, "{\"ok\":true}");
     String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
     drawCentered(ipMsg.c_str(), 10);
   }
-  // SET_WIFI
+  // SET_WIFI - Requires physical confirmation
   else if (strcmp(cmd, "SET_WIFI") == 0) {
+    if (!pin_verified) {
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"device_locked\"}");
+      return;
+    }
+    
     String ssid = doc["ssid"];
     String pass = doc["password"];
-    if (ssid.length() > 0) {
+    
+    if (ssid.length() == 0) {
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"empty_ssid\"}");
+      return;
+    }
+    
+    // SECURITY: Display confirmation on OLED and wait for button press
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_7x14B_tf);
+    u8g2.drawStr(5, 15, "SET WIFI?");
+    u8g2.setFont(u8g2_font_6x10_tf);
+    
+    // Truncate SSID if too long for display
+    String displaySsid = ssid.length() > 18 ? ssid.substring(0, 15) + "..." : ssid;
+    u8g2.drawStr(5, 30, displaySsid.c_str());
+    
+    u8g2.drawStr(5, 50, "OK=Confirm BACK=Cancel");
+    u8g2.sendBuffer();
+    
+    // Wait up to 30 seconds for button press
+    unsigned long confirmStart = millis();
+    bool confirmed = false;
+    bool cancelled = false;
+    
+    while (millis() - confirmStart < 30000 && !confirmed && !cancelled) {
+      if (digitalRead(BTN_OK) == LOW) {
+        delay(50); // Debounce
+        if (digitalRead(BTN_OK) == LOW) {
+          confirmed = true;
+          while (digitalRead(BTN_OK) == LOW) delay(10); // Wait for release
+        }
+      }
+      if (digitalRead(BTN_BACK) == LOW) {
+        delay(50); // Debounce
+        if (digitalRead(BTN_BACK) == LOW) {
+          cancelled = true;
+          while (digitalRead(BTN_BACK) == LOW) delay(10); // Wait for release
+        }
+      }
+      delay(10);
+    }
+    
+    if (confirmed) {
       Preferences wifiPrefs;
       wifiPrefs.begin("wifi", false);
       wifiPrefs.putString("ssid", ssid);
       wifiPrefs.putString("password", pass);
       wifiPrefs.end();
-      wsServer.sendTXT(num, "{\"ok\":true}");
-      delay(500);
+      
+      drawCentered("WiFi Saved!", 0);
+      wsSendEncrypted(num, "{\"ok\":true}");
+      delay(1000);
       ESP.restart();
     } else {
-      wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"empty_ssid\"}");
+      drawCentered("WiFi Cancelled", 0);
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"user_cancelled\"}");
+      delay(1500);
     }
+  }
+  // RECOVERY_INIT - Generate and display recovery code on device
+  else if (strcmp(cmd, "RECOVERY_INIT") == 0) {
+    if (!pin_verified) {
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"device_locked\"}");
+      return;
+    }
+    
+    // Generate random 6-digit code
+    recovery_code = esp_random() % 1000000;  // 0-999999
+    recovery_code_expires = millis() + RECOVERY_CODE_TIMEOUT_MS;
+    
+    // Display on OLED
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_7x14B_tf);
+    u8g2.drawStr(10, 15, "RECOVERY CODE:");
+    u8g2.setFont(u8g2_font_10x20_tf);  // Large font for code
+    char codeStr[8];
+    snprintf(codeStr, sizeof(codeStr), "%06lu", recovery_code);
+    u8g2.drawStr(30, 40, codeStr);
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 55, "Enter in app. 2min timeout");
+    u8g2.sendBuffer();
+    
+    Serial.println("[WS] Recovery code generated (not logged for security)");
+    wsSendEncrypted(num, "{\"ok\":true,\"message\":\"code_displayed\"}");
   }
   // RECOVER
   else if (strcmp(cmd, "RECOVER") == 0) {
     if (!pin_verified) {
-      wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"device_locked\"}");
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"device_locked\"}");
       return;
     }
+    
+    // SECURITY: Verify device code
+    if (recovery_code == 0 || millis() > recovery_code_expires) {
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"no_recovery_code\",\"message\":\"Call RECOVERY_INIT first\"}");
+      return;
+    }
+    
+    uint32_t providedCode = doc["device_code"] | 0;
+    if (providedCode != recovery_code) {
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"invalid_code\"}");
+      // Invalidate code after failed attempt
+      recovery_code = 0;
+      recovery_code_expires = 0;
+      drawCentered("Wrong code!", 0);
+      delay(2000);
+      return;
+    }
+    
+    // Code verified - invalidate it
+    recovery_code = 0;
+    recovery_code_expires = 0;
     
     String words[12];
     bool hasWords = true;
@@ -2050,8 +2297,8 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
       for (int i = 0; i < 12 && allWordsValid; i++) {
         bool found = false;
         for (int j = 0; j < 256; j++) {
-          const char* word = (const char*)pgm_read_ptr(&MNEMONIC_WORDS[j]);
-          if (words[i].equals(word)) {
+          // On ESP32, PROGMEM is directly accessible (no pgm_read needed)
+          if (words[i].equals(MNEMONIC_WORDS[j])) {
             entropy[i] = j;
             found = true;
             break;
@@ -2064,7 +2311,7 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
       }
       
       if (!allWordsValid) {
-        wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"invalid_word\"}");
+        wsSendEncrypted(num, "{\"ok\":false,\"error\":\"invalid_word\"}");
         drawCentered("Invalid word!", 0);
         delay(2000);
         return;
@@ -2093,23 +2340,23 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
           mnemonicWords[i] = words[i];
         }
         
-        wsServer.sendTXT(num, "{\"ok\":true}");
+        wsSendEncrypted(num, "{\"ok\":true}");
         drawCentered("Recovered!", 0);
         delay(2000);
         ESP.restart();
       } else {
-        wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"storage_failed\"}");
+        wsSendEncrypted(num, "{\"ok\":false,\"error\":\"storage_failed\"}");
         drawCentered("Storage error!", 0);
         delay(2000);
       }
     } else {
-      wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"missing_words\"}");
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"missing_words\"}");
     }
   }
   // FACTORY_RESET
   else if (strcmp(cmd, "FACTORY_RESET") == 0) {
     if (!pin_verified) {
-      wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"device_locked\"}");
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"device_locked\"}");
       return;
     }
     
@@ -2149,7 +2396,7 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
       miscPrefs.clear();
       miscPrefs.end();
       
-      wsServer.sendTXT(num, "{\"ok\":true,\"message\":\"factory_reset_complete\"}");
+      wsSendEncrypted(num, "{\"ok\":true,\"message\":\"factory_reset_complete\"}");
       
       drawCentered("Reset Complete!", -10);
       drawCentered("Restarting...", 10);
@@ -2157,7 +2404,7 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
       ESP.restart();
     } else {
       // User cancelled
-      wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"cancelled\"}");
+      wsSendEncrypted(num, "{\"ok\":false,\"error\":\"cancelled\"}");
       drawCentered("Cancelled", 0);
       delay(1000);
       String ipMsg = WiFi.localIP().toString() + ":" + String(SERVER_PORT);
@@ -2167,7 +2414,7 @@ void handleWSMessage(uint8_t num, uint8_t* payload, size_t length) {
   }
   // Unknown
   else {
-    wsServer.sendTXT(num, "{\"ok\":false,\"error\":\"unknown_cmd\"}");
+    wsSendEncrypted(num, "{\"ok\":false,\"error\":\"unknown_cmd\"}");
   }
 }
 

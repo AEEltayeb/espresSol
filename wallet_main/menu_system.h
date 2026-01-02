@@ -80,17 +80,36 @@ const int SETTINGS_MENU_SIZE = 1;
 MenuState currentMenu = MENU_IDLE;
 int menuSelection = 0;
 int menuScrollOffset = 0;
-unsigned long lastButtonPress = 0;
-const unsigned long DEBOUNCE_MS = 200;
+
+// Per-button debouncing for responsive navigation
+unsigned long lastPressUp = 0;
+unsigned long lastPressDown = 0;
+unsigned long lastPressOK = 0;
+unsigned long lastPressBack = 0;
+bool wasPressed[4] = {false, false, false, false}; // Track button states for edge detection
+
+const unsigned long DEBOUNCE_MS = 150; // Reduced for snappier response
 const unsigned long MENU_TIMEOUT_MS = 30000; // Return to idle after 30s
 
 // ===== BUTTON READING =====
+// Returns true only on button press (falling edge), not while held
 inline bool buttonPressed(int pin) {
-  if (digitalRead(pin) == LOW) {
-    if (millis() - lastButtonPress > DEBOUNCE_MS) {
-      lastButtonPress = millis();
+  bool isPressed = (digitalRead(pin) == LOW);
+  int btnIdx = (pin == BTN_UP) ? 0 : (pin == BTN_DOWN) ? 1 : (pin == BTN_OK) ? 2 : 3;
+  unsigned long* lastPress = (pin == BTN_UP) ? &lastPressUp : 
+                              (pin == BTN_DOWN) ? &lastPressDown : 
+                              (pin == BTN_OK) ? &lastPressOK : &lastPressBack;
+  
+  if (isPressed && !wasPressed[btnIdx]) {
+    // Button just pressed (falling edge)
+    if (millis() - *lastPress > DEBOUNCE_MS) {
+      *lastPress = millis();
+      wasPressed[btnIdx] = true;
       return true;
     }
+  } else if (!isPressed) {
+    // Button released
+    wasPressed[btnIdx] = false;
   }
   return false;
 }
@@ -219,8 +238,9 @@ inline void showFactoryResetScreen() {
 
 // ===== MENU INPUT HANDLER =====
 inline void handleMenuInput() {
-  // Check for menu timeout
-  if (currentMenu != MENU_IDLE && millis() - lastButtonPress > MENU_TIMEOUT_MS) {
+  // Check for menu timeout (use most recent button press as activity timer)
+  unsigned long lastActivity = max(max(lastPressUp, lastPressDown), max(lastPressOK, lastPressBack));
+  if (currentMenu != MENU_IDLE && lastActivity > 0 && millis() - lastActivity > MENU_TIMEOUT_MS) {
     currentMenu = MENU_IDLE;
     menuSelection = 0;
     menuScrollOffset = 0;

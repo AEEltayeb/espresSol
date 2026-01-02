@@ -908,6 +908,8 @@ function SettingsTab({ setMessage }: { setMessage: (m: string) => void }) {
   const [showLicenses, setShowLicenses] = useState(false);
   const [words, setWords] = useState<string[]>(Array(12).fill(''));
   const [recovering, setRecovering] = useState(false);
+  const [recoveryCodePending, setRecoveryCodePending] = useState(false);
+  const [deviceCode, setDeviceCode] = useState('');
   const [wifiSSID, setWifiSSID] = useState('');
   const [wifiPassword, setWifiPassword] = useState('');
   const [sendingWifi, setSendingWifi] = useState(false);
@@ -934,26 +936,48 @@ function SettingsTab({ setMessage }: { setMessage: (m: string) => void }) {
     setMessage(`Switched to ${network.toUpperCase()}`);
   };
 
-  // Recovery
-  const handleRecovery = async () => {
+  // Recovery - Step 1: Init recovery and show code on device
+  const handleStartRecovery = async () => {
     const cleanWords = words.map(w => w.trim().toLowerCase());
     if (cleanWords.some(w => !w)) {
       setMessage('Please enter all 12 words');
       return;
     }
 
+    setMessage('Requesting device code...');
+    try {
+      await walletService.initRecovery();
+      setRecoveryCodePending(true);
+      setMessage('Enter the 6-digit code shown on your device');
+    } catch (e: any) {
+      setMessage('Error: ' + e.message);
+    }
+  };
+
+  // Recovery - Step 2: Submit with device code
+  const handleRecovery = async () => {
+    const cleanWords = words.map(w => w.trim().toLowerCase());
+    const codeNum = parseInt(deviceCode, 10);
+
+    if (isNaN(codeNum) || deviceCode.length !== 6) {
+      setMessage('Please enter the 6-digit code from device');
+      return;
+    }
+
     setRecovering(true);
+    setRecoveryCodePending(false);
     setShowRecover(false);
     setMessage('Recovering wallet...');
 
     try {
-      const success = await walletService.recover(cleanWords);
+      const success = await walletService.recover(cleanWords, codeNum);
       if (success) {
         setMessage('Recovery successful! Device restarting...');
         setWords(Array(12).fill(''));
+        setDeviceCode('');
         setTimeout(() => disconnect(), 3000);
       } else {
-        setMessage('Recovery failed - check words');
+        setMessage('Recovery failed - check words or code');
       }
     } catch (e: any) {
       setMessage('Error: ' + e.message);
@@ -1207,12 +1231,12 @@ function SettingsTab({ setMessage }: { setMessage: (m: string) => void }) {
           <Text style={[styles.settingValue, { color: colors.textMuted }]}>ESP32 v2.0</Text>
         </View>
         <View style={[styles.settingRow, { borderBottomColor: colors.border + '50', flexDirection: 'column', alignItems: 'flex-start' }]}>
-          <Text style={[styles.settingLabel, { color: colors.text, marginBottom: 8 }]}>Developed by</Text>
-          <TouchableOpacity onPress={() => Linking.openURL('https://github.com/nimamehranfar')} style={{ marginBottom: 4 }}>
-            <Text style={{ color: colors.primary, fontSize: 14 }}>@nimamehranfar</Text>
+          <Text style={[styles.settingLabel, { color: colors.text, marginBottom: 8 }]}>Developed by:</Text>
+          <TouchableOpacity onPress={() => Linking.openURL('https://github.com/AEEltayeb')} style={{ marginBottom: 4 }}>
+            <Text style={{ color: colors.primary, fontSize: 14 }}>👨‍💻@AEEltayeb</Text>
           </TouchableOpacity>
-          <TouchableOpacity onPress={() => Linking.openURL('https://github.com/AEEltayeb')}>
-            <Text style={{ color: colors.primary, fontSize: 14 }}>@AEEltayeb</Text>
+          <TouchableOpacity onPress={() => Linking.openURL('https://github.com/nimamehranfar')}>
+            <Text style={{ color: colors.primary, fontSize: 14 }}>👨‍💻@nimamehranfar</Text>
           </TouchableOpacity>
         </View>
         <TouchableOpacity style={[styles.settingRow, { borderBottomWidth: 0 }]} onPress={() => setShowLicenses(true)}>
@@ -1233,30 +1257,58 @@ function SettingsTab({ setMessage }: { setMessage: (m: string) => void }) {
             <View style={[styles.modalContent, { maxHeight: '90%' }]}>
               <Text style={styles.modalTitle}>Recover Wallet</Text>
               <Text style={[styles.hint, { marginBottom: 16 }]}>
-                Enter your 12-word backup phrase to restore wallet.
+                {recoveryCodePending
+                  ? '🔐 Enter the 6-digit code shown on your device:'
+                  : 'Enter your 12-word backup phrase to restore wallet.'
+                }
               </Text>
 
-              <ScrollView style={{ maxHeight: 300 }}>
-                {words.map((word, index) => (
-                  <View key={index} style={styles.wordInputRow}>
-                    <Text style={styles.wordNumber}>{index + 1}.</Text>
-                    <TextInput
-                      style={[styles.input, styles.wordInput]}
-                      value={word}
-                      onChangeText={(val) => updateWord(index, val)}
-                      placeholder={`Word ${index + 1}`}
-                      placeholderTextColor={COLORS.textMuted}
-                      autoCapitalize="none"
-                      autoCorrect={false}
-                    />
-                  </View>
-                ))}
-              </ScrollView>
+              {!recoveryCodePending ? (
+                <>
+                  <ScrollView style={{ maxHeight: 300 }}>
+                    {words.map((word, index) => (
+                      <View key={index} style={styles.wordInputRow}>
+                        <Text style={styles.wordNumber}>{index + 1}.</Text>
+                        <TextInput
+                          style={[styles.input, styles.wordInput]}
+                          value={word}
+                          onChangeText={(val) => updateWord(index, val)}
+                          placeholder={`Word ${index + 1}`}
+                          placeholderTextColor={COLORS.textMuted}
+                          autoCapitalize="none"
+                          autoCorrect={false}
+                        />
+                      </View>
+                    ))}
+                  </ScrollView>
 
-              <TouchableOpacity style={[styles.button, { marginTop: 16 }]} onPress={handleRecovery} disabled={recovering}>
-                {recovering ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Recover</Text>}
-              </TouchableOpacity>
-              <TouchableOpacity style={[styles.button, styles.cancelButton, { marginTop: 8 }]} onPress={() => setShowRecover(false)}>
+                  <TouchableOpacity style={[styles.button, { marginTop: 16 }]} onPress={handleStartRecovery} disabled={recovering}>
+                    {recovering ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Get Device Code</Text>}
+                  </TouchableOpacity>
+                </>
+              ) : (
+                <>
+                  <TextInput
+                    style={[styles.input, { fontSize: 24, textAlign: 'center', letterSpacing: 4 }]}
+                    value={deviceCode}
+                    onChangeText={setDeviceCode}
+                    placeholder="000000"
+                    placeholderTextColor={COLORS.textMuted}
+                    keyboardType="number-pad"
+                    maxLength={6}
+                  />
+
+                  <TouchableOpacity style={[styles.button, { marginTop: 16 }]} onPress={handleRecovery} disabled={recovering}>
+                    {recovering ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Recover Wallet</Text>}
+                  </TouchableOpacity>
+
+                  <TouchableOpacity style={[styles.button, styles.cancelButton, { marginTop: 8 }]} onPress={() => setRecoveryCodePending(false)}>
+                    <Text style={styles.buttonText}>Back</Text>
+                  </TouchableOpacity>
+                </>
+              )}
+
+              <TouchableOpacity style={[styles.button, styles.cancelButton, { marginTop: 8 }]} onPress={() => { setShowRecover(false); setRecoveryCodePending(false); setDeviceCode(''); }}>
                 <Text style={styles.buttonText}>Cancel</Text>
               </TouchableOpacity>
             </View>

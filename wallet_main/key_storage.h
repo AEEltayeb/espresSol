@@ -116,15 +116,8 @@ inline bool storeRecoveredKey(Preferences& prefs, const uint8_t pinKey[16],
                                const uint8_t salt[16],
                                const uint8_t sk[32], const uint8_t pk[32], 
                                const String mnemonic[12]) {
-  Serial.println("[RECOVERY] storeRecoveredKey called");
-  Serial.print("[RECOVERY] Mnemonic: ");
-  for (int i = 0; i < 12; i++) {
-    Serial.print(mnemonic[i]);
-    Serial.print(" ");
-  }
-  Serial.println();
+  // SECURITY: Mnemonic is never logged to Serial
   
-  // Encrypt private key with PIN-derived key
   // Encrypt private key with PIN-derived key
   uint8_t encrypted[48];
   uint8_t iv[12];
