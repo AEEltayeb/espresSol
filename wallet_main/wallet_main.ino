@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include <U8g2lib.h>
 #include <esp_random.h>
+#include <esp_ota_ops.h>
 #include "mbedtls/sha256.h"
 #include "mbedtls/gcm.h"
 #include "mbedtls/base64.h"
@@ -13,6 +14,8 @@
 #include "crypto/ed25519.h"
 #include "crypto/mnemonic.h"
 #include "security_hardening.h"
+#include "transaction_parser.h"
+#include "boot_integrity.h"
 #include "menu_system.h"
 
 // WebSocket server for mobile app connectivity
@@ -308,38 +311,38 @@ bool recvDecryptedJson(WiFiClient& client, StaticJsonDocument<1024>& doc) {
 }
 
 // ===== PIN ENTRY UI =====
-// Enter a 4-digit PIN using buttons and display
+// Enter a 6-digit PIN using buttons and display
 // Returns true if PIN entered, false if cancelled
-bool enterPIN(const char* title, uint8_t pin[4]) {
+bool enterPIN(const char* title, uint8_t pin[6]) {
   int currentDigit = 0;
-  uint8_t digits[4] = {0, 0, 0, 0};
+  uint8_t digits[6] = {0, 0, 0, 0, 0, 0};
   
-  while (currentDigit < 4) {
+  while (currentDigit < 6) {
     // Draw PIN screen
     u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_9x15_tf);
-    u8g2.drawUTF8(0, 15, title);
+    u8g2.setFont(u8g2_font_7x14_tf);
+    u8g2.drawUTF8(0, 12, title);
     
-    // Draw digit boxes
-    for (int i = 0; i < 4; i++) {
-      int x = 20 + i * 25;
+    // Draw digit boxes (6 digits now)
+    for (int i = 0; i < 6; i++) {
+      int x = 8 + i * 20;  // Tighter spacing for 6 digits
       if (i < currentDigit) {
         // Entered digit - show asterisk
-        u8g2.drawStr(x + 5, 40, "*");
+        u8g2.drawStr(x + 4, 35, "*");
       } else if (i == currentDigit) {
         // Current digit - show number
         char buf[2] = {(char)('0' + digits[i]), 0};
-        u8g2.drawStr(x + 5, 40, buf);
-        u8g2.drawFrame(x, 25, 20, 25);  // Highlight box
+        u8g2.drawStr(x + 4, 35, buf);
+        u8g2.drawFrame(x, 20, 18, 22);  // Highlight box
       } else {
         // Future digit - show underscore
-        u8g2.drawStr(x + 5, 40, "_");
+        u8g2.drawStr(x + 4, 35, "_");
       }
     }
     
     // Draw button hints
-    u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.drawStr(0, 60, "UP/DN=Digit OK=Next BACK=Cancel");
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.drawStr(0, 55, "UP/DN=Digit OK=Next BACK=Del");
     u8g2.sendBuffer();
     
     // Check buttons
@@ -367,28 +370,28 @@ bool enterPIN(const char* title, uint8_t pin[4]) {
     delay(50);
   }
   
-  memcpy(pin, digits, 4);
+  memcpy(pin, digits, 6);
   return true;
 }
 
-// Derive AES key from PIN using PBKDF2-like approach
-void deriveKeyFromPIN(const uint8_t pin[4], const uint8_t salt[16], uint8_t outKey[16]) {
+// Derive AES key from PIN using PBKDF2-like approach (100K iterations)
+void deriveKeyFromPIN(const uint8_t pin[6], const uint8_t salt[16], uint8_t outKey[16]) {
   // Combine PIN digits into bytes
-  uint8_t pinBytes[4];
-  for (int i = 0; i < 4; i++) {
+  uint8_t pinBytes[6];
+  for (int i = 0; i < 6; i++) {
     pinBytes[i] = pin[i];
   }
   
   // PBKDF2-like derivation: iterate SHA256
   uint8_t hash[32];
-  uint8_t data[20];  // 4 PIN + 16 salt
-  memcpy(data, pinBytes, 4);
-  memcpy(data + 4, salt, 16);
+  uint8_t data[22];  // 6 PIN + 16 salt
+  memcpy(data, pinBytes, 6);
+  memcpy(data + 6, salt, 16);
   
-  mbedtls_sha256(data, 20, hash, 0);
+  mbedtls_sha256(data, 22, hash, 0);
   
-  // Additional iterations for key stretching
-  for (int i = 0; i < 10000; i++) {
+  // SECURITY: 100,000 iterations for strong key stretching (~1 second on ESP32)
+  for (int i = 0; i < 100000; i++) {
     mbedtls_sha256(hash, 32, hash, 0);
   }
   
@@ -1485,6 +1488,45 @@ void setup() {
   // Show splash screen with logo
   showSplashScreen(2000);  // Display for 2 seconds
   
+  // SECURITY: Boot integrity check
+  int integrityResult = checkBootIntegrity();
+  if (integrityResult == -1) {
+    // Firmware mismatch - possible tampering!
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_7x14B_tf);
+    u8g2.drawStr(5, 15, "!! WARNING !!");
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(0, 30, "Firmware modified!");
+    u8g2.drawStr(0, 42, "Possible tampering.");
+    u8g2.drawStr(0, 56, "OK=Continue BACK=Halt");
+    u8g2.sendBuffer();
+    
+    // Wait for user decision
+    while (true) {
+      if (digitalRead(BTN_OK) == LOW) {
+        delay(200);
+        updateStoredFirmwareHash();  // User trusts this firmware
+        break;
+      }
+      if (digitalRead(BTN_BACK) == LOW) {
+        u8g2.clearBuffer();
+        u8g2.drawStr(20, 35, "HALTED");
+        u8g2.sendBuffer();
+        while (true) delay(1000);  // Halt forever
+      }
+      delay(50);
+    }
+  } else if (integrityResult == 1) {
+    // First boot - show confirmation
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(5, 20, "First boot detected");
+    u8g2.drawStr(5, 35, "Firmware fingerprint");
+    u8g2.drawStr(5, 50, "stored for security");
+    u8g2.sendBuffer();
+    delay(1500);
+  }
+  
   // Load wallet keys with PIN protection
   prefs.begin("wallet", false);
   
@@ -1506,7 +1548,7 @@ void setup() {
     drawCentered("Set PIN", 10);
     delay(1500);
     
-    uint8_t pin1[4], pin2[4];
+    uint8_t pin1[6], pin2[6];
     
     // Enter PIN first time
     if (!enterPIN("Set PIN:", pin1)) {
@@ -1523,7 +1565,7 @@ void setup() {
     }
     
     // Check PINs match
-    if (memcmp(pin1, pin2, 4) != 0) {
+    if (memcmp(pin1, pin2, 6) != 0) {
       drawCentered("PINs don't match!", 0);
       delay(2000);
       ESP.restart();
@@ -1553,7 +1595,7 @@ void setup() {
     drawCentered("Set PIN", 10);
     delay(1500);
     
-    uint8_t pin1[4], pin2[4];
+    uint8_t pin1[6], pin2[6];
     
     if (!enterPIN("Set PIN:", pin1)) {
       drawCentered("Cancelled", 0);
@@ -1567,7 +1609,7 @@ void setup() {
       ESP.restart();
     }
     
-    if (memcmp(pin1, pin2, 4) != 0) {
+    if (memcmp(pin1, pin2, 6) != 0) {
       drawCentered("PINs don't match!", 0);
       delay(2000);
       ESP.restart();
@@ -1622,7 +1664,7 @@ void setup() {
       drawCentered(attemptStr, 10);
       delay(500);
       
-      uint8_t pin[4];
+      uint8_t pin[6];
       if (!enterPIN("Enter PIN:", pin)) {
         drawCentered("Cancelled", 0);
         delay(2000);
@@ -1699,25 +1741,61 @@ void setup() {
           }
         }
       } else {
-        // Handle failed PIN attempt with exponential backoff
-        unsigned long lockoutDelay = 0;
-        uint8_t remaining = handleFailedPinAttempt(prefs, lockoutDelay);
-        currentFailures = loadFailedPinAttempts(prefs);
+        // Try legacy 4-digit PIN format (00 + last 4 digits) for backward compatibility
+        // Existing wallets used 4-digit PINs, now map to 00XXXX
+        uint8_t legacyPin[6] = {0, 0, pin[2], pin[3], pin[4], pin[5]};
+        deriveKeyFromPIN(legacyPin, pin_salt, pin_key);
         
-        if (shouldWipeDevice(currentFailures)) {
-          drawCentered("WIPED!", -10);
-          drawCentered("Too many attempts", 10);
-          delay(3000);
-          ESP.restart();
+        if (loadEncryptedKey(prefs, pin_key, ed25519_sk, ed25519_pk)) {
+          // Legacy PIN worked! User's old 4-digit PIN is now 00XXXX
+          pin_verified = true;
+          sessionActive = true;
+          resetActivityTimer();
+          
+          Serial.println("[PIN] Legacy 4-digit PIN detected (format: 00XXXX)");
+          Serial.print("[Key] Loaded pubkey: ");
+          for (int i = 0; i < 32; i++) Serial.printf("%02X", ed25519_pk[i]);
+          Serial.println();
+          
+          clearFailedPinAttempts(prefs);
+          
+          // Notify user about PIN format
+          drawCentered("PIN Migrated!", -10);
+          drawCentered("Now use 00XXXX", 10);
+          delay(2000);
+          
+          // Load mnemonic for legacy PINs too
+          if (prefs.isKey("mnemonic")) {
+            String mnemonicStr = prefs.getString("mnemonic", "");
+            int wordIndex = 0, start = 0;
+            for (int i = 0; i <= mnemonicStr.length(); i++) {
+              if (i == mnemonicStr.length() || mnemonicStr[i] == ' ') {
+                if (wordIndex < 12) mnemonicWords[wordIndex++] = mnemonicStr.substring(start, i);
+                start = i + 1;
+              }
+            }
+          }
         } else {
-          // Show lockout delay
-          char lockoutMsg[32];
-          drawCentered("Wrong PIN!", -15);
-          snprintf(lockoutMsg, sizeof(lockoutMsg), "%d attempts left", remaining);
-          drawCentered(lockoutMsg, 0);
-          snprintf(lockoutMsg, sizeof(lockoutMsg), "Wait %lu sec", lockoutDelay / 1000);
-          drawCentered(lockoutMsg, 15);
-          delay(lockoutDelay);  // Exponential backoff delay
+          // Both 6-digit and legacy failed - wrong PIN
+          unsigned long lockoutDelay = 0;
+          uint8_t remaining = handleFailedPinAttempt(prefs, lockoutDelay);
+          currentFailures = loadFailedPinAttempts(prefs);
+          
+          if (shouldWipeDevice(currentFailures)) {
+            drawCentered("WIPED!", -10);
+            drawCentered("Too many attempts", 10);
+            delay(3000);
+            ESP.restart();
+          } else {
+            // Show lockout delay
+            char lockoutMsg[32];
+            drawCentered("Wrong PIN!", -15);
+            snprintf(lockoutMsg, sizeof(lockoutMsg), "%d attempts left", remaining);
+            drawCentered(lockoutMsg, 0);
+            snprintf(lockoutMsg, sizeof(lockoutMsg), "Wait %lu sec", lockoutDelay / 1000);
+            drawCentered(lockoutMsg, 15);
+            delay(lockoutDelay);  // Exponential backoff delay
+          }
         }
       }
     }

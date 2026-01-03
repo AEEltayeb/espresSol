@@ -446,10 +446,10 @@ inline void handleMenuInput() {
         u8g2.sendBuffer();
         delay(500);
         
-        uint8_t oldPIN[4], newPIN1[4], newPIN2[4];
+        uint8_t oldPIN[6], newPIN1[6], newPIN2[6];
         
         // Enter current PIN
-        extern bool enterPIN(const char*, uint8_t[4]);
+        extern bool enterPIN(const char*, uint8_t[6]);
         if (!enterPIN("Current PIN:", oldPIN)) {
           u8g2.clearBuffer();
           drawCenteredLarge("Cancelled", 0);
@@ -463,7 +463,7 @@ inline void handleMenuInput() {
         
         // Verify current PIN matches
         extern uint8_t pin_key[16], pin_salt[16];
-        extern void deriveKeyFromPIN(const uint8_t pin[4], const uint8_t salt[16], uint8_t outKey[16]);
+        extern void deriveKeyFromPIN(const uint8_t pin[6], const uint8_t salt[16], uint8_t outKey[16]);
         extern Preferences prefs;
         uint8_t testKey[16];
         deriveKeyFromPIN(oldPIN, pin_salt, testKey);
@@ -503,7 +503,7 @@ inline void handleMenuInput() {
         }
         
         // Check PINs match
-        if (memcmp(newPIN1, newPIN2, 4) != 0) {
+        if (memcmp(newPIN1, newPIN2, 6) != 0) {
           u8g2.clearBuffer();
           drawCenteredLarge("No Match!", 0);
           u8g2.sendBuffer();

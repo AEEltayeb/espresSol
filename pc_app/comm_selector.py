@@ -16,7 +16,7 @@ import hashlib
 
 
 # Default ESP32 address - UPDATE THIS with your ESP32's IP!
-ESP32_HOST = "172.20.10.9"  
+ESP32_HOST = "192.168.1.100"  # Update this with your ESP32's IP!  
 ESP32_PORT = 8443
 
 # TLS settings
