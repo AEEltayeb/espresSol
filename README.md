@@ -1,77 +1,149 @@
-# DIY Hardware Wallet 🔐
+# espresSol - DIY Hardware Wallet 🔐
 
 A secure Solana hardware wallet using ESP32 with Ed25519 signing, encrypted communication, and multi-factor authentication.
 
+
 ## Features
 
-✅ **Hardware Security**
-- Ed25519 key generation on ESP32
-- Hardware RNG for cryptographic randomness
-- PIN-protected encrypted key storage
-- 3-attempt lockout (persists across reboots)
+###  Security
+- **6-digit PIN** with 100,000 PBKDF2 iterations
+- **PIN brute force protection** - exponential backoff + device wipe after 10 fails
+- **Session timeout** - auto-locks after 5 minutes
+- **Sign rate limiting** - max 5 transactions/minute  
+- **Boot integrity check** - detects firmware tampering
+- **Per-device TLS certificates** - generated on first boot
 
-✅ **Encrypted Communication**
-- USB: ECDH key exchange + AES-GCM encryption
-- WiFi: ECDH key exchange + AES-GCM encryption
-- Optional TLS wrapper for WiFi
+###  Cryptography
+- **Ed25519** digital signatures (TweetNaCl)
+- **BIP39** 12-word mnemonic backup
+- **SLIP-0010** Solana-compatible key derivation
+- **AES-128-GCM** encrypted key storage
+- **Hardware TRNG** for cryptographic randomness
 
-✅ **User Experience**
-- 4-button interface (UP, DOWN, OK, BACK)
-- OLED display for transaction details
-- 12-word mnemonic backup/recovery
-- Transaction confirmation with hash preview
+###  Communication
+- **USB**: ECDH key exchange + AES-GCM encryption
+- **WiFi**: TLS 1.2/1.3 with per-device certificates
+- **Mobile**: WebSocket + ECDH + pairing code verification
+
+---
+
+## Requirements
+
+### Hardware
+| Component | Description |
+|-----------|-------------|
+| ESP32 | Any ESP32 board with WiFi (ESP32-WROOM recommended) |
+| OLED Display | 128x64 I2C SSD1306 |
+| Buttons | 4x momentary push buttons |
+
+### Software
+
+#### ESP32 Firmware
+- Arduino IDE 2.0+ or PlatformIO
+- ESP32 board package 2.x+
+- Required libraries:
+  - **U8g2** (OLED display)
+  - **ArduinoJson** (JSON parsing)
+  - **WebSocketsServer** (mobile connectivity)
+
+#### PC Application
+- Python 3.8+
+- Dependencies in `pc_app/requirements.txt`
+
+#### Mobile Application
+- Node.js 18+
+- Expo CLI
 
 ---
 
 ## Quick Start
 
-### 1. Flash ESP32
+### 1. Flash ESP32 Firmware
 
-1. Open `wallet_main/wallet_main.ino` in Arduino IDE
-2. Install required libraries (Sketch → Include Library → Manage Libraries):
-   - **U8g2** - OLED display driver
-   - **ArduinoJson** - JSON parsing
-3. Select your ESP32 board
-4. Upload!
-
-> **Note:** TLS uses ESP32's built-in mbedTLS - no additional library needed!
-
-### 2. Run PC App
-
-**Windows:** Navigate to `pc_app/` and double-click **`START_WALLET.bat`**
-
-**Mac/Linux:**
 ```bash
-cd pc_app
-chmod +x START_WALLET.sh
-./START_WALLET.sh
+# Using Arduino IDE
+1. Open wallet_main/wallet_main.ino
+2. Install libraries: Sketch → Include Library → Manage Libraries
+   - U8g2
+   - ArduinoJson
+   - WebSocketsServer
+3. Select ESP32 board
+4. Upload!
 ```
 
-**First run:** Automatically installs dependencies and opens `config.json` for you to enter your ESP32's IP address.
+The device will:
+- Generate unique TLS certificate on first boot (~30-60 seconds)
+- Prompt you to set a 6-digit PIN
+- Generate and display 12-word recovery phrase
 
-**Every run after:** Just starts the wallet!
+### 2. Wire Hardware
+
+```
+ESP32 Pinout:
+┌─────────────────────────────┐
+│  OLED (I2C)                 │
+│  SDA → GPIO 21              │
+│  SCL → GPIO 22              │
+│  VCC → 3.3V                 │
+│  GND → GND                  │
+├─────────────────────────────┤
+│  Buttons (to GND)           │
+│  OK    → GPIO 4  (White)    │
+│  DOWN  → GPIO 23 (Red)      │
+│  UP    → GPIO 19 (Blue)     │
+│  BACK  → GPIO 18 (Blue)     │
+└─────────────────────────────┘
+```
+
+### 3. Run PC Application
+
+```bash
+cd pc_app
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Edit config with your ESP32's IP
+# (shown on device screen when in WiFi mode)
+notepad config.json  # Windows
+nano config.json     # Linux/Mac
+
+# Run wallet
+python wallet_cli.py
+```
+
+**Or use the launcher scripts:**
+- Windows: Double-click `START_WALLET.bat`
+- Linux/Mac: `./START_WALLET.sh`
+
+### 4. Run Mobile Application
+
+```bash
+cd gui_wallet
+
+# Install dependencies
+npm install
+
+# Start Expo
+npm start
+```
 
 ---
 
-## Hardware Requirements
+## Configuration
 
-| Component | Description |
-|-----------|-------------|
-| ESP32 | Any ESP32 board with WiFi |
-| OLED Display | 128x64 I2C SSD1306 |
-| Buttons | 4x momentary push buttons |
-| Wiring | See below |
+### PC App (pc_app/config.json)
+```json
+{
+    "esp32_ip": "192.168.1.100",  // Your ESP32's IP
+    "port": 8443,
+    "use_tls": true,
+    "rpc_url": "https://api.devnet.solana.com"
+}
+```
 
-### Button Wiring
-
-| Button | Color | GPIO | Function |
-|--------|-------|------|----------|
-| OK | White | 4 | Confirm/Approve |
-| DOWN | Red | 23 | Decrement/Reject |
-| UP | Blue | 19 | Increment/Scroll |
-| BACK | Blue | 18 | Back/Cancel |
-
-All buttons connect to GND (use internal pull-up).
+### WiFi Setup
+WiFi credentials are configured through the device menu or via USB command.
 
 ---
 
@@ -79,59 +151,38 @@ All buttons connect to GND (use internal pull-up).
 
 ### First Boot
 1. Power on ESP32
-2. Set 4-digit PIN (UP/DOWN to change digit, OK to confirm)
-3. Confirm PIN
-4. Write down 12-word mnemonic backup!
+2. Wait for certificate generation (~30-60 seconds)
+3. Set 6-digit PIN (UP/DOWN to change, OK to confirm)
+4. Confirm PIN
+5. **Write down the 12-word mnemonic backup!**
 
 ### Normal Boot
-1. Power on ESP32
-2. Enter PIN
-3. Select WiFi or USB mode
-4. Connect with PC client
+1. Enter 6-digit PIN
+2. Select connection mode (USB/WiFi)
+3. Connect with PC or mobile app
 
-### USB Mode
-1. Select USB on ESP32
-2. Run `wallet_cli.py` → Option 2
-3. Enter COM port (Windows) or /dev/ttyUSB0 (Linux)
-4. Verify pairing code on OLED
-5. Press OK to approve
-
-### WiFi Mode
-1. Select WiFi on ESP32
-2. Note the IP address shown
-3. Update `config.json` with IP
-4. Run `wallet_cli.py` → Option 1
+### Emergency Wipe
+Hold **OK + BACK** buttons for 3 seconds to wipe all data.
 
 ---
 
-## Security
+## Security Architecture
 
 | Feature | Implementation |
-|---------|---------------|
-| Key Storage | AES-GCM encrypted with PIN |
-| Key Derivation | PBKDF2-like (10,000 SHA256 iterations) |
-| USB Encryption | ECDH secp256r1 + AES-GCM |
-| WiFi Encryption | TLS 1.2 + ECDH + AES-GCM |
-| Mnemonic Storage | AES-GCM encrypted |
-| PIN Lockout | 3 attempts, persists across reboots |
+|---------|----------------|
+| Key Storage | AES-128-GCM encrypted with PIN |
+| Key Derivation | PBKDF2 (100,000 SHA256 iterations) |
+| USB Encryption | ECDH P-256 + AES-GCM |
+| WiFi Encryption | TLS 1.2 + per-device certificates |
+| Mobile Encryption | ECDH P-256 + AES-GCM + pairing code |
+| PIN Protection | Exponential backoff, wipe after 10 fails |
+| Session Security | 5-minute timeout, rate limiting |
 
-### TLS Certificates
-
-The TLS certificates are **bundled with the project**:
-- **ESP32:** Embedded in `wallet_main/tls_server.h`
-- **PC Client:** Stored in `pc_app/tls/server.crt`
-
-When you copy the project to another PC, everything works automatically:
-1. The ESP32 already has certs compiled in
-2. The PC client loads `tls/server.crt` automatically
-3. No manual certificate installation needed!
-
-**To regenerate certificates** (optional):
-```bash
-cd pc_app/tls
-python generate_certs.py
-# Then update tls_server.h with new cert/key
-```
+### Certificate Generation
+Each device generates its own RSA 2048-bit key and X.509 certificate on first boot:
+- Uses ESP32 hardware TRNG for randomness
+- Stored in NVS (non-volatile storage)
+- No secrets in source code
 
 ---
 
@@ -139,44 +190,54 @@ python generate_certs.py
 
 ```
 DIY_Hardware_Wallet/
-├── wallet_main/          # ESP32 firmware
-│   ├── wallet_main.ino   # Main firmware
-│   ├── key_storage.h     # Encrypted key management
-│   ├── display_ui.h      # OLED display functions
-│   └── crypto/           # Cryptographic functions
-├── pc_app/               # Python PC client
-│   ├── wallet_cli.py     # Main CLI application
-│   ├── secure_channel.py # AES-GCM encryption
-│   ├── comm_selector.py  # USB/WiFi connection
-│   ├── config.json       # Configuration
-│   └── requirements.txt  # Python dependencies
-├── setup.bat             # Windows setup
-├── setup.sh              # Unix setup
-└── run_wallet.bat        # Quick launcher
+├── wallet_main/              # ESP32 firmware
+│   ├── wallet_main.ino       # Main firmware
+│   ├── security_hardening.h  # PIN/session/rate limiting
+│   ├── boot_integrity.h      # Firmware verification
+│   ├── transaction_parser.h  # TX display
+│   ├── cert_generator.h      # Per-device TLS certs
+│   ├── key_storage.h         # Encrypted key management
+│   └── crypto/               # Ed25519, BIP39, SLIP-0010
+├── pc_app/                   # Python PC client
+│   ├── wallet_cli.py         # Main CLI
+│   ├── secure_channel.py     # AES-GCM encryption
+│   ├── comm_selector.py      # USB/WiFi connection
+│   └── requirements.txt      # Python dependencies
+├── gui_wallet/               # React Native mobile app
+│   ├── src/services/         # Wallet & crypto services
+│   └── package.json          # Node dependencies
+└── README.md
 ```
 
 ---
 
 ## Troubleshooting
 
-**"Connection refused"**
-- Check ESP32 IP address in config.json
-- Ensure ESP32 and PC are on same network
+| Problem | Solution |
+|---------|----------|
+| "Connection refused" | Check ESP32 IP in config.json |
+| "Certificate error" | First connection prompts for TOFU approval |
+| "Wrong PIN" lockout | After 10 fails, device wipes - restore from mnemonic |
+| USB not detected | Install CH340/CP2102 drivers |
+| Compilation errors | Install all Arduino libraries, use ESP32 board 2.x+ |
 
-**"Wrong PIN" lockout**
-- After 3 failed attempts, device locks permanently
-- Erase flash and restore from mnemonic
+---
 
-**USB not detected**
-- Install CH340/CP2102 drivers
-- Try different USB port
+## Contributing
 
-**Compilation errors**
-- Install all required Arduino libraries
-- Use ESP32 board package 2.x+
+Contributions welcome! Please ensure:
+- No hardcoded secrets or credentials
+- Security-conscious code review
+- Test on actual hardware
 
 ---
 
 ## License
 
 MIT License - See LICENSE file
+
+---
+
+## Disclaimer
+
+This is a DIY project for educational purposes. Use at your own risk. For significant funds, consider using established hardware wallets with formal security audits.

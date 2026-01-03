@@ -1,13 +1,19 @@
-# DIY Hardware Wallet - Python Dependencies
+# espresSol PC App - Python Dependencies
 # Install with: pip install -r requirements.txt
 
-# Core dependencies
-pyserial>=3.5
-solana>=0.30.0
+# Solana SDK
 solders>=0.18.0
-base58>=2.1.0
-pycryptodome>=3.19.0
-cryptography>=41.0.0
+solana>=0.30.0
 
-# Optional - for development
+# Cryptography
+pycryptodome>=3.19.0
+ecdsa>=0.18.0
+
+# Serial communication (USB)
+pyserial>=3.5
+
+# Base58 encoding
+base58>=2.1.1
+
+# Optional: Colorful terminal output
 colorama>=0.4.6
