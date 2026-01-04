@@ -27,6 +27,20 @@ A secure Solana hardware wallet using ESP32 with Ed25519 signing, encrypted comm
 
 ---
 
+## Screenshots
+
+### Mobile App
+
+| Home | Analytics | Send |
+|:----:|:---------:|:----:|
+| ![Home](docs/images/app_home.png) | ![Analytics](docs/images/app_analytics.png) | ![Send](docs/images/app_send.png) |
+
+| Device Confirmation | Pairing |
+|:-------------------:|:-------:|
+| ![Confirm](docs/images/app_confirm.png) | ![Pairing](docs/images/app_pairing.png) |
+
+---
+
 ## Requirements
 
 ### Hardware
