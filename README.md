@@ -32,14 +32,23 @@ A secure Solana hardware wallet using ESP32 with Ed25519 signing, encrypted comm
 ### Mobile App
 
 <p align="center">
-  <img src="docs/images/app_home.png" width="180" alt="Home">
-  <img src="docs/images/app_analytics.png" width="180" alt="Analytics">
+  <img src="docs/images/app_home.png" width="180" alt="Home">&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="docs/images/app_analytics.png" width="180" alt="Analytics">&nbsp;&nbsp;&nbsp;&nbsp;
   <img src="docs/images/app_send.png" width="180" alt="Send">
+</p>
+<p align="center">
+  <em>Home</em>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <em>Analytics</em>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <em>Send SOL</em>
 </p>
 
 <p align="center">
-  <img src="docs/images/app_confirm.png" width="180" alt="Device Confirmation">
+  <img src="docs/images/app_confirm.png" width="180" alt="Device Confirmation">&nbsp;&nbsp;&nbsp;&nbsp;
   <img src="docs/images/app_pairing.png" width="180" alt="Pairing">
+</p>
+<p align="center">
+  <em>Device Confirmation</em>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <em>Pairing Code</em>
 </p>
 
 ---
